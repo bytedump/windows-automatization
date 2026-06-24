@@ -41,6 +41,37 @@ MANUAL - from an ADMIN PowerShell (admin: it creates C:\SandboxTest at C: root):
 
 
 ========================================
+ IF SMART APP CONTROL / SMARTSCREEN BLOCKS run-sandbox.bat
+========================================
+
+Why: the .bat is unsigned AND you ran it from the WSL share
+(\\wsl.localhost\... = a NETWORK / untrusted zone). Together, Smart App
+Control (SAC) / SmartScreen blocks it. This is NOT a virus.
+
+Do NOT disable Smart App Control - it protects the whole machine and you
+do not need to. The real trigger is the network location, not the content.
+
+Fix - run from a LOCAL path. In an ADMIN PowerShell:
+
+  # 1) copy tests to a local disk (leaves the \\wsl.localhost network zone)
+  #    drag the tests folder into the window to autofill <full-path-to>\tests
+  Copy-Item "<full-path-to>\tests" "C:\sandbox-test" -Recurse -Force
+
+  # 2) strip the Mark of the Web (the "untrusted file" tag) from everything
+  Get-ChildItem C:\sandbox-test -Recurse | Unblock-File
+
+  # 3) run it
+  cd C:\sandbox-test
+  powershell -ExecutionPolicy Bypass -File .\prep.ps1
+
+A command you TYPE in an admin console is user-initiated, so SAC does not
+block it the way it blocks double-clicking an untrusted file from a share.
+
+Note: Unblock-File removes the Mark of the Web, but running straight from
+\\wsl.localhost keeps the network-zone block - so copy to C:\ FIRST.
+
+
+========================================
  INSIDE THE SANDBOX (re-run by hand)
 ========================================
 
