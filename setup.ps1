@@ -542,39 +542,95 @@ $y = 82
 # Guards against TextChanged recursion when a handler programmatically sets .Text.
 $script:SuppressUser = $false
 $script:SuppressIp   = $false
-$script:SuppressFull = $false
+$script:SuppressName = $false
 $script:IpPrevLen    = 0
 
 # --- group: User ---
-$gUser = New-Group 'User' $gx $y $gw 214
+$gUser = New-Group 'User' $gx $y $gw 288
 $py = 28
+# --- Full name: First | Last side by side, divided by a bar. Tab flows left->right then down.
+# Tab order == control add-order (the form sets NO explicit TabIndex anywhere); keep First added
+# before Last before Username or the tab flow silently breaks. The read-only field below shows the
+# Title-Cased concatenation that is actually used downstream ($TxtFullName).
+$nameColW   = 240
+$nameRightX = 16 + $nameColW + 16    # left col 16..256, 16px gap, right col 272..512
+
+$lblFirst = New-Object System.Windows.Forms.Label
+$lblFirst.Text = 'First name'; $lblFirst.AutoSize = $true; $lblFirst.ForeColor = $ClrMuted; $lblFirst.Font = $FontBase
+$lblFirst.Location = New-Object System.Drawing.Point(16, $py)
+$gUser.Controls.Add($lblFirst)
+$starFirst = New-Object System.Windows.Forms.Label
+$starFirst.Text = ' *'; $starFirst.AutoSize = $true; $starFirst.ForeColor = $ClrReq; $starFirst.Font = $FontBase
+$starFirst.Location = New-Object System.Drawing.Point((16 + $lblFirst.PreferredWidth - 4), $py)
+$gUser.Controls.Add($starFirst)
+$TxtFirstName = New-TextBox $nameColW
+$TxtFirstName.Location = New-Object System.Drawing.Point(16, ($py + 20))
+$Tip.SetToolTip($TxtFirstName, 'First name as written on the ticket.')
+$gUser.Controls.Add($TxtFirstName)
+
+# vertical divider bar, centered in the gap between the two columns
+$NameBar = New-Object System.Windows.Forms.Panel
+$NameBar.Size = New-Object System.Drawing.Size(2, 25)
+$NameBar.Location = New-Object System.Drawing.Point((16 + $nameColW + 7), ($py + 20))
+$NameBar.BackColor = $ClrMuted
+$gUser.Controls.Add($NameBar)
+
+$lblLast = New-Object System.Windows.Forms.Label
+$lblLast.Text = 'Last name'; $lblLast.AutoSize = $true; $lblLast.ForeColor = $ClrMuted; $lblLast.Font = $FontBase
+$lblLast.Location = New-Object System.Drawing.Point($nameRightX, $py)
+$gUser.Controls.Add($lblLast)
+$starLast = New-Object System.Windows.Forms.Label
+$starLast.Text = ' *'; $starLast.AutoSize = $true; $starLast.ForeColor = $ClrReq; $starLast.Font = $FontBase
+$starLast.Location = New-Object System.Drawing.Point(($nameRightX + $lblLast.PreferredWidth - 4), $py)
+$gUser.Controls.Add($starLast)
+$TxtLastName = New-TextBox $nameColW
+$TxtLastName.Location = New-Object System.Drawing.Point($nameRightX, ($py + 20))
+$Tip.SetToolTip($TxtLastName, 'Last name (surname) as written on the ticket.')
+$gUser.Controls.Add($TxtLastName)
+$py = $py + 20 + 25 + 12
+
+# Read-only output: the two names concatenated and Title-Cased (the display name actually used).
+$lblFull = New-Object System.Windows.Forms.Label
+$lblFull.Text = 'Full name (auto)'; $lblFull.AutoSize = $true; $lblFull.ForeColor = $ClrMuted; $lblFull.Font = $FontBase
+$lblFull.Location = New-Object System.Drawing.Point(16, $py)
+$gUser.Controls.Add($lblFull)
 $TxtFullName = New-TextBox
-$Tip.SetToolTip($TxtFullName, 'Name shown on the ticket. Becomes the user display name.')
-$py = Add-Field $gUser 'Full name (from the ticket)' $TxtFullName 16 $py $true
-# Normalize the display name (Title Case) when focus leaves the field. Guarded so the
-# programmatic set does not re-enter the live sanitizer below.
-$TxtFullName.Add_Leave({
-    $n = Format-FullName $TxtFullName.Text
-    if ($n -and $n -ne $TxtFullName.Text) {
-        $script:SuppressFull = $true
-        $TxtFullName.Text = $n
-        $script:SuppressFull = $false
-    }
-})
-# Live cleanup: block digits/symbols as you type, keeping letters, spaces, hyphen and
-# apostrophe (so 'Anne-Marie' and "O'Brien" survive - same char class as Format-FullName).
-# Title Case is applied on Leave/submit, not live (avoids fighting the cursor mid-word).
-$TxtFullName.Add_TextChanged({
-    if ($script:SuppressFull) { return }
-    $raw   = $TxtFullName.Text
+$TxtFullName.ReadOnly  = $true
+$TxtFullName.TabStop   = $false
+$TxtFullName.BackColor = $ClrBg
+$TxtFullName.Location  = New-Object System.Drawing.Point(16, ($py + 20))
+$gUser.Controls.Add($TxtFullName)
+$py = $py + 20 + 25 + 12
+
+# Live: sanitize each field (letters/space/hyphen/apostrophe), then refresh the concatenation.
+# Inputs keep raw casing; the read-only output above is the source of truth (Title Case). The
+# concat is always "First Last" (never flipped). Shared SuppressName guard is safe: each handler
+# only sets its OWN box, and $TxtFullName has no TextChanged so the concat write cannot recurse.
+$TxtFirstName.Add_TextChanged({
+    if ($script:SuppressName) { return }
+    $raw   = $TxtFirstName.Text
     $clean = [regex]::Replace($raw, "[^\p{L}\s\-']", '')
     if ($clean -ne $raw) {
-        $caret = $TxtFullName.SelectionStart - ($raw.Length - $clean.Length)
-        $script:SuppressFull = $true
-        $TxtFullName.Text = $clean
-        $script:SuppressFull = $false
-        $TxtFullName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+        $caret = $TxtFirstName.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressName = $true
+        $TxtFirstName.Text = $clean
+        $script:SuppressName = $false
+        $TxtFirstName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
     }
+    $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
+})
+$TxtLastName.Add_TextChanged({
+    if ($script:SuppressName) { return }
+    $raw   = $TxtLastName.Text
+    $clean = [regex]::Replace($raw, "[^\p{L}\s\-']", '')
+    if ($clean -ne $raw) {
+        $caret = $TxtLastName.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressName = $true
+        $TxtLastName.Text = $clean
+        $script:SuppressName = $false
+        $TxtLastName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
+    $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
 })
 $TxtUsername = New-TextBox
 $Tip.SetToolTip($TxtUsername, 'Windows login and email prefix. Use lowercase, e.g. joao.silva')
@@ -605,7 +661,7 @@ $LblEmail = New-Object System.Windows.Forms.Label
 $LblEmail.AutoSize = $true; $LblEmail.ForeColor = $ClrAccent; $LblEmail.Font = $FontGroup
 $LblEmail.Location = New-Object System.Drawing.Point(16, $py); $LblEmail.Text = 'Email: ---'
 $gUser.Controls.Add($LblEmail)
-$y += 214 + 12
+$y += 288 + 12
 
 # --- group: Network ---
 $gNet = New-Group 'Network' $gx $y $gw 92
@@ -751,8 +807,8 @@ $BtnOk.Add_Click({
     $errs = [System.Collections.Generic.List[string]]::new()
     $ErrProvider.Clear()
     if ((Format-FullName $TxtFullName.Text) -eq '') {
-        $errs.Add('Full name: letters and spaces only - hyphens and apostrophes are OK, but no digits or other symbols. Example: Joao Silva.')
-        $ErrProvider.SetError($TxtFullName, 'Letters and spaces only (hyphen/apostrophe OK, no digits).')
+        $errs.Add('Full name: fill in first and last name - letters only (hyphens and apostrophes OK, no digits). Example: Joao Silva.')
+        $ErrProvider.SetError($TxtFirstName, 'Fill first/last name - letters only.')
     }
     $un = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
     if (-not (Test-Username $un)) {
