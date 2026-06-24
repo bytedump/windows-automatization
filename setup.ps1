@@ -238,115 +238,209 @@ if (Test-Path $NinitePath) {
 if (-not $Unattended) {
 try {
 
+# --- palette and fonts ---
+$ClrBg      = [System.Drawing.Color]::FromArgb(245, 246, 248)
+$ClrCard    = [System.Drawing.Color]::White
+$ClrText    = [System.Drawing.Color]::FromArgb(32, 32, 32)
+$ClrMuted   = [System.Drawing.Color]::FromArgb(110, 115, 125)
+$ClrAccent  = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$ClrAccentD = [System.Drawing.Color]::FromArgb(0, 102, 184)
+$ClrReq     = [System.Drawing.Color]::FromArgb(200, 40, 40)
+$FontBase   = New-Object System.Drawing.Font('Segoe UI', 9)
+$FontH1     = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+$FontGroup  = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text            = 'Configuracao de Maquina Nova'
-$Form.Size            = New-Object System.Drawing.Size(520, 660)
 $Form.StartPosition   = 'CenterScreen'
 $Form.FormBorderStyle = 'FixedDialog'
 $Form.MaximizeBox     = $false
-$Form.BackColor       = [System.Drawing.Color]::FromArgb(245, 246, 248)
-$Form.ForeColor       = [System.Drawing.Color]::FromArgb(32, 32, 32)
-$Form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+$Form.MinimizeBox     = $false
+$Form.BackColor       = $ClrBg
+$Form.ForeColor       = $ClrText
+$Form.Font            = $FontBase
 
-function Add-Label([System.Windows.Forms.Form]$f, [string]$text, [int]$x, [int]$y) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text     = $text
-    $l.Location = New-Object System.Drawing.Point($x, $y)
-    $l.AutoSize = $true
-    $f.Controls.Add($l)
-}
+$CW  = 544          # client width
+$gx  = 16           # group left margin
+$gw  = 528          # group width
+$Tip = New-Object System.Windows.Forms.ToolTip
 
-function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
+# Flat single-line text box (width only; position set by Add-Field or caller).
+function New-TextBox([int]$w = 496) {
     $t = New-Object System.Windows.Forms.TextBox
-    $t.Location    = New-Object System.Drawing.Point($x, $y)
-    $t.Size        = New-Object System.Drawing.Size($w, 23)
+    $t.Size        = New-Object System.Drawing.Size($w, 25)
     $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $t.BackColor   = [System.Drawing.Color]::White
+    $t.BackColor   = $ClrCard
     return $t
 }
-
-function New-Combo([int]$x, [int]$y, [int]$w = 480) {
+# Flat read-only dropdown (width only; position set by Add-Field or caller).
+function New-Combo([int]$w = 496) {
     $c = New-Object System.Windows.Forms.ComboBox
-    $c.Location      = New-Object System.Drawing.Point($x, $y)
-    $c.Size          = New-Object System.Drawing.Size($w, 23)
+    $c.Size          = New-Object System.Drawing.Size($w, 25)
     $c.DropDownStyle = 'DropDownList'
     $c.FlatStyle     = [System.Windows.Forms.FlatStyle]::Flat
-    $c.BackColor     = [System.Drawing.Color]::White
+    $c.BackColor     = $ClrCard
     return $c
 }
+# A titled GroupBox added to the form; returns it for child placement.
+function New-Group([string]$title, [int]$x, [int]$y, [int]$w, [int]$h) {
+    $g = New-Object System.Windows.Forms.GroupBox
+    $g.Text      = $title
+    $g.Font      = $FontGroup
+    $g.ForeColor = $ClrText
+    $g.Location  = New-Object System.Drawing.Point($x, $y)
+    $g.Size      = New-Object System.Drawing.Size($w, $h)
+    $Form.Controls.Add($g)
+    return $g
+}
+# Stack a muted label (with optional red required '*') above a control inside
+# $parent at relative (px,py). Returns the next free py.
+function Add-Field($parent, [string]$labelText, $control, [int]$px, [int]$py, [bool]$required = $false) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $labelText; $l.AutoSize = $true; $l.ForeColor = $ClrMuted; $l.Font = $FontBase
+    $l.Location = New-Object System.Drawing.Point($px, $py)
+    $parent.Controls.Add($l)
+    if ($required) {
+        $star = New-Object System.Windows.Forms.Label
+        $star.Text = ' *'; $star.AutoSize = $true; $star.ForeColor = $ClrReq; $star.Font = $FontBase
+        $star.Location = New-Object System.Drawing.Point(($px + $l.PreferredWidth - 4), $py)
+        $parent.Controls.Add($star)
+    }
+    $control.Location = New-Object System.Drawing.Point($px, ($py + 20))
+    $parent.Controls.Add($control)
+    return ($py + 20 + $control.Height + 12)
+}
 
-$y = 12
+# --- header band ---
+$Header = New-Object System.Windows.Forms.Panel
+$Header.Location  = New-Object System.Drawing.Point(0, 0)
+$Header.Size      = New-Object System.Drawing.Size($CW, 70)
+$Header.BackColor = $ClrCard
+$Form.Controls.Add($Header)
+$AccentBar = New-Object System.Windows.Forms.Panel
+$AccentBar.Location  = New-Object System.Drawing.Point(0, 0)
+$AccentBar.Size      = New-Object System.Drawing.Size(6, 70)
+$AccentBar.BackColor = $ClrAccent
+$Header.Controls.Add($AccentBar)
+$LblTitle = New-Object System.Windows.Forms.Label
+$LblTitle.Text = 'Configuracao de Maquina Nova'; $LblTitle.Font = $FontH1
+$LblTitle.ForeColor = $ClrText; $LblTitle.AutoSize = $true
+$LblTitle.Location = New-Object System.Drawing.Point(20, 12)
+$Header.Controls.Add($LblTitle)
+$LblSub = New-Object System.Windows.Forms.Label
+$LblSub.Text = 'Preencha os dados do chamado para provisionar o computador.'
+$LblSub.Font = $FontBase; $LblSub.ForeColor = $ClrMuted; $LblSub.AutoSize = $true
+$LblSub.Location = New-Object System.Drawing.Point(22, 42)
+$Header.Controls.Add($LblSub)
 
-Add-Label $Form 'Nome completo (do chamado):' 10 $y; $y += 20
-$TxtFullName = New-TextBox 10 $y; $Form.Controls.Add($TxtFullName); $y += 35
+$y = 82
 
-Add-Label $Form 'Username (ex: joao.silva):' 10 $y; $y += 20
-$TxtUsername = New-TextBox 10 $y; $Form.Controls.Add($TxtUsername); $y += 35
-
-Add-Label $Form 'Dominio de email:' 10 $y; $y += 20
-$CmbDomain = New-Combo 10 $y 300
+# --- group: Usuario ---
+$gUser = New-Group 'Usuario' $gx $y $gw 214
+$py = 28
+$TxtFullName = New-TextBox
+$Tip.SetToolTip($TxtFullName, 'Nome que aparece no chamado. Vira o nome de exibicao do usuario.')
+$py = Add-Field $gUser 'Nome completo (do chamado)' $TxtFullName 16 $py $true
+$TxtUsername = New-TextBox
+$Tip.SetToolTip($TxtUsername, 'Login do Windows e prefixo do e-mail. Use minusculas, ex: joao.silva')
+$py = Add-Field $gUser 'Username (ex: joao.silva)' $TxtUsername 16 $py $true
+$CmbDomain = New-Combo 250
 $EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
 $CmbDomain.SelectedIndex = 0
-$Form.Controls.Add($CmbDomain); $y += 35
+$py = Add-Field $gUser 'Dominio de e-mail' $CmbDomain 16 $py
+$LblEmail = New-Object System.Windows.Forms.Label
+$LblEmail.AutoSize = $true; $LblEmail.ForeColor = $ClrAccent; $LblEmail.Font = $FontGroup
+$LblEmail.Location = New-Object System.Drawing.Point(16, $py); $LblEmail.Text = 'E-mail: ---'
+$gUser.Controls.Add($LblEmail)
+$y += 214 + 12
 
-Add-Label $Form 'Configuracao de rede:' 10 $y; $y += 20
+# --- group: Rede ---
+$gNet = New-Group 'Rede' $gx $y $gw 92
 $RadioDhcp            = New-Object System.Windows.Forms.RadioButton
 $RadioDhcp.Text       = 'DHCP (automatico)'
-$RadioDhcp.Location   = New-Object System.Drawing.Point(10, $y)
 $RadioDhcp.AutoSize   = $true
 $RadioDhcp.Checked    = $true
+$RadioDhcp.Location   = New-Object System.Drawing.Point(16, 28)
 $RadioStatic          = New-Object System.Windows.Forms.RadioButton
 $RadioStatic.Text     = 'IP Estatico'
-$RadioStatic.Location = New-Object System.Drawing.Point(190, $y)
 $RadioStatic.AutoSize = $true
-$Form.Controls.Add($RadioDhcp); $Form.Controls.Add($RadioStatic); $y += 30
-
+$RadioStatic.Location = New-Object System.Drawing.Point(200, 28)
+$gNet.Controls.AddRange(@($RadioDhcp, $RadioStatic))
+$LblNetHint = New-Object System.Windows.Forms.Label
+$LblNetHint.Text = 'O endereco IP sera obtido automaticamente pela rede.'
+$LblNetHint.AutoSize = $true; $LblNetHint.ForeColor = $ClrMuted; $LblNetHint.Font = $FontBase
+$LblNetHint.Location = New-Object System.Drawing.Point(16, 60)
+$gNet.Controls.Add($LblNetHint)
 $LblIp      = New-Object System.Windows.Forms.Label
-$LblIp.Text = 'IP (ex: 10.0.X.X):'
-$LblIp.Location = New-Object System.Drawing.Point(10, $y)
-$LblIp.AutoSize = $true
+$LblIp.Text = 'IP (ex: 10.0.X.X)'
+$LblIp.AutoSize = $true; $LblIp.ForeColor = $ClrMuted; $LblIp.Font = $FontBase
+$LblIp.Location = New-Object System.Drawing.Point(16, 60)
 $LblIp.Visible  = $false
-$TxtIp          = New-TextBox 140 $y 160
+$TxtIp          = New-TextBox 180
+$TxtIp.Location = New-Object System.Drawing.Point(150, 57)
 $TxtIp.Visible  = $false
-$Form.Controls.Add($LblIp); $Form.Controls.Add($TxtIp); $y += 35
+$gNet.Controls.AddRange(@($LblIp, $TxtIp))
 
-$RadioStatic.Add_CheckedChanged({ $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
-$RadioDhcp.Add_CheckedChanged({   $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
+$RadioStatic.Add_CheckedChanged({
+    $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
+    $LblNetHint.Visible = -not $RadioStatic.Checked })
+$RadioDhcp.Add_CheckedChanged({
+    $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
+    $LblNetHint.Visible = -not $RadioStatic.Checked })
+$y += 92 + 12
 
-Add-Label $Form 'Impressora principal:' 10 $y; $y += 20
-$CmbPrinter = New-Combo 10 $y
+# --- group: Perifericos e aplicativos ---
+$gPer = New-Group 'Perifericos e aplicativos' $gx $y $gw 118
+$py = 28
+$CmbPrinter = New-Combo
 $CmbPrinter.Items.Add('(Nenhuma)') | Out-Null
 foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) — $($p.model) [$($p.ip)]") | Out-Null }
 $CmbPrinter.SelectedIndex = 0
-$Form.Controls.Add($CmbPrinter); $y += 35
-
-Add-Label $Form 'Setor (para assinatura):' 10 $y; $y += 20
-$CmbSector = New-Combo 10 $y
-$Form.Controls.Add($CmbSector); $y += 35
-
-Add-Label $Form 'Assinatura base (.htm):' 10 $y; $y += 20
-$CmbSigTemplate = New-Combo 10 $y
-$CmbSigTemplate.Items.Add('(Automatico — primeiro encontrado)') | Out-Null
-$CmbSigTemplate.SelectedIndex = 0
-$Form.Controls.Add($CmbSigTemplate); $y += 35
-
+$py = Add-Field $gPer 'Impressora principal' $CmbPrinter 16 $py
 $ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
 $ChkWebAgent.Text     = 'Instalar WebAgent'
-$ChkWebAgent.Location = New-Object System.Drawing.Point(10, $y)
 $ChkWebAgent.AutoSize = $true
-$Form.Controls.Add($ChkWebAgent); $y += 40
+$ChkWebAgent.Location = New-Object System.Drawing.Point(16, $py)
+$Tip.SetToolTip($ChkWebAgent, 'Marque para instalar o agente de monitoramento (WebAgent).')
+$gPer.Controls.Add($ChkWebAgent)
+$y += 118 + 12
+
+# --- group: Assinatura de e-mail ---
+$gSig = New-Group 'Assinatura de e-mail' $gx $y $gw 140
+$py = 28
+$CmbSector = New-Combo
+$py = Add-Field $gSig 'Setor' $CmbSector 16 $py
+$CmbSigTemplate = New-Combo
+$CmbSigTemplate.Items.Add('(Automatico — primeiro encontrado)') | Out-Null
+$CmbSigTemplate.SelectedIndex = 0
+$py = Add-Field $gSig 'Modelo (.htm)' $CmbSigTemplate 16 $py
+$y += 140 + 16
+
+# --- footer buttons ---
+$BtnCancel = New-Object System.Windows.Forms.Button
+$BtnCancel.Text = 'Cancelar'
+$BtnCancel.Size = New-Object System.Drawing.Size(120, 38)
+$BtnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnCancel.BackColor = $ClrCard; $BtnCancel.ForeColor = $ClrText
+$BtnCancel.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(200, 205, 212)
+$BtnCancel.Location = New-Object System.Drawing.Point(16, $y)
+$BtnCancel.Cursor = [System.Windows.Forms.Cursors]::Hand
+$BtnCancel.Add_Click({ $Form.Close() })
+$Form.Controls.Add($BtnCancel)
 
 $BtnOk          = New-Object System.Windows.Forms.Button
 $BtnOk.Text     = 'Iniciar Configuracao'
-$BtnOk.Location = New-Object System.Drawing.Point(10, $y)
-$BtnOk.Size     = New-Object System.Drawing.Size(480, 35)
+$BtnOk.Size     = New-Object System.Drawing.Size(264, 38)
+$BtnOk.Font     = $FontGroup
+$BtnOk.Location = New-Object System.Drawing.Point(($gx + $gw - 264), $y)
 $BtnOk.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-$BtnOk.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$BtnOk.BackColor = $ClrAccent
 $BtnOk.ForeColor = [System.Drawing.Color]::White
 $BtnOk.FlatAppearance.BorderSize          = 0
-$BtnOk.FlatAppearance.MouseOverBackColor  = [System.Drawing.Color]::FromArgb(0, 102, 184)
+$BtnOk.FlatAppearance.MouseOverBackColor  = $ClrAccentD
 $BtnOk.FlatAppearance.MouseDownBackColor  = [System.Drawing.Color]::FromArgb(0, 90, 158)
 $BtnOk.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$y += 38 + 16
 $BtnOk.Add_Click({
     if (-not $TxtFullName.Text.Trim()) {
         [System.Windows.Forms.MessageBox]::Show('Preencha o nome completo.', 'Setup', 'OK', 'Warning') | Out-Null; return
@@ -399,6 +493,19 @@ $CmbSector.Add_SelectedIndexChanged({
 # Carga inicial: dispara evento de dominio para popular setores e templates
 $CmbDomain.SelectedIndex = -1
 $CmbDomain.SelectedIndex = 0
+
+# Preview do e-mail em tempo real (username@dominio)
+$UpdateEmail = {
+    $u = $TxtUsername.Text.Trim().ToLower()
+    $d = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { '' }
+    $LblEmail.Text = if ($u) { "E-mail: $u@$d" } else { 'E-mail: ---' }
+}
+$TxtUsername.Add_TextChanged($UpdateEmail)
+$CmbDomain.Add_SelectedIndexChanged($UpdateEmail)
+& $UpdateEmail
+
+# Ajusta a altura da janela ao conteudo montado
+$Form.ClientSize = New-Object System.Drawing.Size($CW, $y)
 
 $Form.ShowDialog() | Out-Null
 
