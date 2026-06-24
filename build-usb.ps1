@@ -78,6 +78,6 @@ Write-Host "OK: autounattend.xml generated at $OutPath" -ForegroundColor Green
 Write-Host "Bootstrap account: $AdminUser" -ForegroundColor Green
 Write-Host ""
 Write-Host "REMINDERS:" -ForegroundColor Yellow
-Write-Host "  - In config.ps1, \$AdminAccount MUST be '$AdminUser'." -ForegroundColor Yellow
+Write-Host "  - In config.ps1, `$AdminAccount MUST be '$AdminUser'." -ForegroundColor Yellow
 Write-Host "  - The generated autounattend.xml holds the password - NEVER commit it (already in .gitignore)." -ForegroundColor Yellow
-Write-Host "  - This is the BOOTSTRAP password; setup.ps1 rotates it to the real one (\$AdminNewPass) on first login." -ForegroundColor Yellow
+Write-Host "  - This is the BOOTSTRAP password; setup.ps1 rotates it to the real one (`$AdminNewPass) on first login." -ForegroundColor Yellow
