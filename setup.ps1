@@ -244,6 +244,9 @@ $Form.Size            = New-Object System.Drawing.Size(520, 660)
 $Form.StartPosition   = 'CenterScreen'
 $Form.FormBorderStyle = 'FixedDialog'
 $Form.MaximizeBox     = $false
+$Form.BackColor       = [System.Drawing.Color]::FromArgb(245, 246, 248)
+$Form.ForeColor       = [System.Drawing.Color]::FromArgb(32, 32, 32)
+$Form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
 
 function Add-Label([System.Windows.Forms.Form]$f, [string]$text, [int]$x, [int]$y) {
     $l = New-Object System.Windows.Forms.Label
@@ -255,8 +258,10 @@ function Add-Label([System.Windows.Forms.Form]$f, [string]$text, [int]$x, [int]$
 
 function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
     $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = New-Object System.Drawing.Point($x, $y)
-    $t.Size     = New-Object System.Drawing.Size($w, 23)
+    $t.Location    = New-Object System.Drawing.Point($x, $y)
+    $t.Size        = New-Object System.Drawing.Size($w, 23)
+    $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $t.BackColor   = [System.Drawing.Color]::White
     return $t
 }
 
@@ -265,6 +270,8 @@ function New-Combo([int]$x, [int]$y, [int]$w = 480) {
     $c.Location      = New-Object System.Drawing.Point($x, $y)
     $c.Size          = New-Object System.Drawing.Size($w, 23)
     $c.DropDownStyle = 'DropDownList'
+    $c.FlatStyle     = [System.Windows.Forms.FlatStyle]::Flat
+    $c.BackColor     = [System.Drawing.Color]::White
     return $c
 }
 
@@ -333,6 +340,13 @@ $BtnOk          = New-Object System.Windows.Forms.Button
 $BtnOk.Text     = 'Iniciar Configuracao'
 $BtnOk.Location = New-Object System.Drawing.Point(10, $y)
 $BtnOk.Size     = New-Object System.Drawing.Size(480, 35)
+$BtnOk.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnOk.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$BtnOk.ForeColor = [System.Drawing.Color]::White
+$BtnOk.FlatAppearance.BorderSize          = 0
+$BtnOk.FlatAppearance.MouseOverBackColor  = [System.Drawing.Color]::FromArgb(0, 102, 184)
+$BtnOk.FlatAppearance.MouseDownBackColor  = [System.Drawing.Color]::FromArgb(0, 90, 158)
+$BtnOk.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $BtnOk.Add_Click({
     if (-not $TxtFullName.Text.Trim()) {
         [System.Windows.Forms.MessageBox]::Show('Preencha o nome completo.', 'Setup', 'OK', 'Warning') | Out-Null; return
