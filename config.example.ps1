@@ -30,7 +30,7 @@ $WifiSSID    = "NETWORK_NAME"
 $WifiPass    = "WIFI_PASSWORD"
 
 # --- Paths — everything on the USB ($ScriptDir = USB root, set by setup.ps1) ---
-$PathOffice     = "$ScriptDir\Office"               # ODT; falls back to OfficeSetup.exe at the root if absent
+$PathOffice     = "$ScriptDir\Office"               # ODT folder: needs setup.exe + configuration.xml (copy configuration.example.xml); falls back to OfficeSetup.exe at the root
 $PathBelarc     = $ScriptDir                        # belarc.exe at the USB root
 $PathEpson      = "$ScriptDir\Drivers Epson"        # folder with .exe drivers
 $PathWebAgent   = "$ScriptDir\20.WebAgent\windows"  # folder with the WebAgent .msi

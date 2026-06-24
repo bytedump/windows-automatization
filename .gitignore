@@ -4,6 +4,9 @@ config.ps1
 # Impressoras reais (IPs/setores internos) — usar printers.example.json como base
 printers.json
 
+# Office ODT — a configuration.xml real pode ter PIDKEY (LTSC); só a example vai no repo
+configuration.xml
+
 # autounattend.xml real (gerado pelo build-usb.ps1 com a senha bootstrap) — so o
 # autounattend.template.xml vai no repo. NUNCA commitar o gerado.
 autounattend.xml

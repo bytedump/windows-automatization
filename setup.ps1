@@ -368,9 +368,12 @@ if (Test-Path $PrintersJson) {
 # in PHASE 7, after the pool).
 $BgInstalls = [System.Collections.Generic.List[object]]::new()
 function Start-BgInstall {
-    param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0))
+    param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0), [string]$WorkingDirectory)
     $params = @{ FilePath = $FilePath; PassThru = $true }
     if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
+    # ODT (and any installer that resolves source files relative to CWD) needs a deterministic
+    # working dir; without it Start-Process inherits whatever launched setup.ps1 (system32).
+    if ($WorkingDirectory) { $params['WorkingDirectory'] = $WorkingDirectory }
     $proc = Start-Process @params
     $BgInstalls.Add([pscustomobject]@{ Name = $Name; Proc = $proc; OkCodes = $OkCodes })
     Write-Log 'INFO' "$Name started in the background (PID $($proc.Id))"
@@ -710,13 +713,20 @@ try {
     $officeOdt   = Join-Path $PathOffice 'setup.exe'
     $officeLocal = Join-Path $ScriptDir 'OfficeSetup.exe'
     if (Test-Path $officeOdt) {
+        # ODT setup.exe needs an action verb; with no args it is a SILENT no-op (installs nothing,
+        # exits 0 -> would log as OK and fool us). configuration.xml is mandatory: it tells ODT what
+        # to install. Working dir = the Office folder so /configure finds the pre-downloaded
+        # \Office\Data next to setup.exe (no SourcePath in the XML -> portable across drive letters).
         $confXml = Join-Path $PathOffice 'configuration.xml'
-        $oArgs = if (Test-Path $confXml) { @('/configure', $confXml) } else { @() }
-        Start-BgInstall 'Office ODT' $officeOdt $oArgs | Out-Null
+        if (Test-Path $confXml) {
+            Start-BgInstall 'Office ODT' $officeOdt @('/configure', $confXml) -WorkingDirectory $PathOffice | Out-Null
+        } else {
+            Write-Log 'ERROR' "Office ODT setup.exe found but configuration.xml missing in $PathOffice (copy configuration.example.xml) - skipped"
+        }
     } elseif (Test-Path $officeLocal) {
         Start-BgInstall 'Office Click-to-Run' $officeLocal | Out-Null
     } else {
-        Write-Log 'WARN' "Office installer not found (share: $PathOffice | USB: $ScriptDir)"
+        Write-Log 'WARN' "Office installer not found (ODT: $officeOdt | USB: $officeLocal)"
     }
 } catch { Write-Log 'ERROR' "Office: $($_.Exception.Message)" }
 

@@ -50,8 +50,8 @@ Done **once** per master USB. The per-machine boot afterwards is fully hands-fre
    ```
 4. **Create `printers.json`** from `printers.example.json` with your real printers.
 5. **Add the binaries / assets** the installers expect (see [USB layout](#usb-drive-layout)):
-   `ninite.exe`, `OfficeSetup.exe`, `belarc.exe`, `Drivers Epson/`, `20.WebAgent/`,
-   the wallpaper, and the `assinatura-2026/` signature templates.
+   `ninite.exe`, the `Office/` ODT folder (see [Office (ODT)](#office-odt)), `belarc.exe`,
+   `Drivers Epson/`, `20.WebAgent/`, the wallpaper, and the `assinatura-2026/` signature templates.
 6. Plug the USB into the target machine and boot from it — the rest is automatic.
 
 > The bootstrap password you set in step 2 is temporary: `setup.ps1` replaces it on first
@@ -70,7 +70,10 @@ USB Root/
   ├── config.ps1                ← Credentials and paths (copy from config.example.ps1 — gitignored)
   ├── printers.json             ← Printer list (copy from printers.example.json — gitignored)
   ├── belarc.exe                ← Belarc Advisor installer
-  ├── OfficeSetup.exe           ← Microsoft 365 Click-to-Run installer
+  ├── Office/                   ← Office Deployment Tool (ODT) — see "Office (ODT)" below
+  │     ├── setup.exe           ←   ODT bootstrapper (download at aka.ms/ODT)
+  │     ├── configuration.xml   ←   copy from configuration.example.xml (gitignored)
+  │     └── Office/Data/        ←   pre-downloaded bits (setup.exe /download — offline mode)
   ├── ninite.exe                ← Download at ninite.com (not committed)
   ├── wallpaper.jpg             ← Wallpaper (filename set in config.ps1 via $WallpaperFile)
   ├── Drivers Epson/            ← Epson driver executables
@@ -300,10 +303,34 @@ WiFi is always DHCP (initial internet). The DHCP/Static choice in the GUI applie
 | Program | Source | Method |
 |---|---|---|
 | Ninite | USB root (`ninite.exe`) | Background (started pre-GUI) |
-| Microsoft Office | `$PathOffice\setup.exe` (ODT) or USB `OfficeSetup.exe` | Click-to-Run, background |
+| Microsoft Office | `$PathOffice\setup.exe` + `configuration.xml` (ODT); falls back to USB `OfficeSetup.exe` | ODT `/configure`, background |
 | Belarc Advisor | USB root (`belarc.exe`) | `/S` silent, background |
 | Epson driver | `Drivers Epson\*.exe` | `/S` silent, background + `Add-Printer` via TCP/IP port |
 | WebAgent | `20.WebAgent\windows\` — `.msi` → `.zip` → `.exe` | `msiexec /quiet` or `/S`, after the pool |
+
+#### Office (ODT)
+
+Office installs via the **Office Deployment Tool**. Two files go in `<USB>\Office\`:
+`setup.exe` (the ODT bootstrapper — download at <https://aka.ms/ODT>) and `configuration.xml`
+(copy from [`configuration.example.xml`](configuration.example.xml) and pick your product/apps).
+
+`setup.ps1` runs `setup.exe /configure configuration.xml` with the working dir set to the
+Office folder. `configuration.xml` is **mandatory** — ODT with no action verb installs nothing
+(silent no-op); the script logs an ERROR and skips Office if it is missing.
+
+**Offline (recommended)** — pre-download the Office bits onto the USB once, so every machine
+installs from the USB with no internet during setup:
+
+```powershell
+cd <USB>\Office
+.\setup.exe /download configuration.xml   # fills <USB>\Office\Office\Data\... (a few GB)
+```
+
+No `SourcePath` is set in the XML, so ODT finds that local `Office\Data` next to `setup.exe`
+automatically — keeping it portable across USB drive letters.
+
+**Online** — skip the `/download`; each machine pulls ~2–4 GB from the Microsoft CDN at
+install time (internet required).
 
 ### Licensing (OEM — Dell)
 Reads `OA3xOriginalProductKey` from UEFI firmware (`Get-CimInstance SoftwareLicensingService`),
