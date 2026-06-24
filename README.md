@@ -230,6 +230,12 @@ manual fallback. Supports `-Unattended` (with `-Test*` parameters) for headless 
 used by the Sandbox harness (no window).
 
 ### Error handling
+- **Input is validated and normalized before any action.** The form sanitizes as you type
+  (username forced to lowercase `name.surname`, accents stripped; the static IP field masks
+  to four `0-255` octets) and **blocks submit** with one consolidated message + per-field
+  markers if anything is still invalid. The same validators re-run at the single point where
+  the GUI and headless `-Test*` paths converge, so automation can't drive the script into a
+  broken state (a malformed `-TestUsername` aborts `FATAL` before any account is created).
 - Every phase is wrapped in `try/catch`; failures are logged `ERROR`/`FATAL` and counted.
 - Installer exit codes are checked (non-zero is `ERROR`, not silently `OK`; `3010` = reboot-required counts as success).
 - The script **exits non-zero** when any error was tracked, so callers (`run.bat`, `FirstLogonCommands`) detect failure.
@@ -314,6 +320,9 @@ once: Ninite (uses msiexec internally) and WebAgent (MSI) never overlap, while O
 | `$AdminAccount` (e.g. `setupadmin`) | Administrator | Technical setup account |
 | New (username) | Standard User | Day-to-day account |
 
+- The username is the Windows login **and** the email prefix: enforced as lowercase
+  `name.surname` (letters + a single dot, no digits/spaces/accents). The **full name** is a
+  separate field — Title-Cased and used as the account display name and in the signature.
 - Initial password: `$UserInitialPass`; never expires; never written to the log.
 
 ### Network configuration
@@ -321,8 +330,10 @@ once: Ninite (uses msiexec internally) and WebAgent (MSI) never overlap, while O
 WiFi is always DHCP (initial internet). The DHCP/Static choice in the GUI applies to the
 **Ethernet** adapter only.
 
-**Static IP** — technician types the IP; mask (`$StaticPrefixLength`), gateway
-(`$StaticGateway`) and DNS (`$DnsServers`) come from `config.ps1`.
+**Static IP** — the technician types only the address; the field auto-inserts dots and
+clamps each octet to `0-255` as they type, and submit is blocked unless it is a valid IPv4.
+Prefix length (`$StaticPrefixLength`), gateway (`$StaticGateway`) and DNS (`$DnsServers`)
+come from `config.ps1`.
 
 ### Program installation
 

@@ -13,6 +13,61 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
+# Input normalizers / validators (pure functions, no UI/theme dependency).
+# Declared at the top so BOTH the interactive form AND the headless -Test*
+# path call the SAME validators - automation cannot drive the script into a
+# broken state. StrictMode-safe (only [regex], System.Text, System.Globalization).
+# ============================================================
+
+# Strip accents: FormD decomposes 'o-acute' -> 'o' + combining mark, drop every
+# NonSpacingMark, recompose. 'c-cedilla' -> 'c'. Handles a-tilde, e-circ, etc.
+function Remove-Diacritics {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $d  = $Text.Normalize([System.Text.NormalizationForm]::FormD)
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($ch in $d.ToCharArray()) {
+        if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
+        }
+    }
+    return $sb.ToString().Normalize([System.Text.NormalizationForm]::FormC)
+}
+
+# Display name (signature + New-LocalUser -FullName): letters/space/hyphen/apostrophe
+# only, Title Case, with Portuguese particles lowercased ('Joao Da Silva' -> 'Joao da Silva').
+function Format-FullName {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $c = [regex]::Replace($Text, "[^\p{L}\s\-']", '')
+    $c = [regex]::Replace($c, '\s+', ' ').Trim()
+    if ($c -eq '') { return '' }
+    $c = (Get-Culture).TextInfo.ToTitleCase($c.ToLower())
+    foreach ($p in 'Da','De','Do','Das','Dos','E') {
+        $c = [regex]::Replace($c, "\b$p\b", $p.ToLower())
+    }
+    return $c
+}
+
+# Login / email prefix: lowercase name.surname. Case-sensitive match so an
+# upstream bug leaving an uppercase char fails loudly instead of slipping through.
+function Test-Username {
+    param([string]$Username)
+    return ($Username -cmatch '^[a-z]+\.[a-z]+$')
+}
+
+# Strict IPv4: exactly 4 octets, each 0-255. Do NOT rely on TryParse alone -
+# it accepts '10.5' (2-part) and hex forms that New-NetIPAddress would choke on.
+function Test-Ipv4 {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return $false }
+    $o = $Ip.Trim() -split '\.'
+    if ($o.Count -ne 4) { return $false }
+    foreach ($x in $o) { if ($x -notmatch '^\d{1,3}$' -or [int]$x -gt 255) { return $false } }
+    return $true
+}
+
+# ============================================================
 # setup.ps1 - Windows 11 Setup
 # Run automatically by autounattend.xml on the first login
 # Requires: config.ps1 at the USB root (gitignored, never commit)
@@ -455,6 +510,10 @@ $CW  = 544          # client width
 $gx  = 16           # group left margin
 $gw  = 528          # group width
 $Tip = New-Object System.Windows.Forms.ToolTip
+# Marks invalid fields with an inline glyph (used by the aggregated submit validator).
+# Not parented to the form, so Form.Dispose() won't free it - harmless in this one-shot flow.
+$ErrProvider = New-Object System.Windows.Forms.ErrorProvider
+$ErrProvider.BlinkStyle = [System.Windows.Forms.ErrorBlinkStyle]::NeverBlink
 
 # --- header band ---
 $Header = New-Object System.Windows.Forms.Panel
@@ -480,15 +539,42 @@ $Header.Controls.Add($LblSub)
 
 $y = 82
 
+# Guards against TextChanged recursion when a handler programmatically sets .Text.
+$script:SuppressUser = $false
+$script:SuppressIp   = $false
+
 # --- group: User ---
 $gUser = New-Group 'User' $gx $y $gw 214
 $py = 28
 $TxtFullName = New-TextBox
 $Tip.SetToolTip($TxtFullName, 'Name shown on the ticket. Becomes the user display name.')
 $py = Add-Field $gUser 'Full name (from the ticket)' $TxtFullName 16 $py $true
+# Normalize the display name (letters only, Title Case) when focus leaves the field.
+$TxtFullName.Add_Leave({
+    $n = Format-FullName $TxtFullName.Text
+    if ($n -and $n -ne $TxtFullName.Text) { $TxtFullName.Text = $n }
+})
 $TxtUsername = New-TextBox
 $Tip.SetToolTip($TxtUsername, 'Windows login and email prefix. Use lowercase, e.g. joao.silva')
 $py = Add-Field $gUser 'Username (e.g. joao.silva)' $TxtUsername 16 $py $true
+# Live cleanup: strip accents (o-acute -> o, c-cedilla -> c) BEFORE filtering so the letter
+# survives, force lowercase, keep only [a-z.], collapse repeated dots. Caret-preserving.
+# Registered BEFORE the email-preview handler (below) so the preview sees the cleaned text.
+# Full name.surname shape is enforced at submit time (Test-Username in the OK handler).
+$TxtUsername.Add_TextChanged({
+    if ($script:SuppressUser) { return }
+    $raw   = $TxtUsername.Text
+    $clean = Remove-Diacritics $raw
+    $clean = [regex]::Replace($clean.ToLower(), '[^a-z.]', '')
+    $clean = [regex]::Replace($clean, '\.{2,}', '.')
+    if ($clean -ne $raw) {
+        $caret = $TxtUsername.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressUser = $true
+        $TxtUsername.Text = $clean
+        $script:SuppressUser = $false
+        $TxtUsername.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
+})
 $CmbDomain = New-Combo 250
 $EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
 $CmbDomain.SelectedIndex = 0
@@ -532,21 +618,59 @@ $RadioStatic.Add_CheckedChanged({
 $RadioDhcp.Add_CheckedChanged({
     $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
     $LblNetHint.Visible = -not $RadioStatic.Checked })
+
+# IP input mask. KeyPress blocks non-digit/non-dot at the source (typing); TextChanged
+# also catches paste/programmatic. Auto-inserts a dot when an octet hits 3 digits, caps at
+# 4 octets, clamps each octet to 255. SuppressIp guards against TextChanged recursion.
+$TxtIp.Add_KeyPress({ param($s, $e)
+    if ([char]::IsControl($e.KeyChar)) { return }   # let backspace/delete through
+    if ($e.KeyChar -ne '.' -and -not [char]::IsDigit($e.KeyChar)) { $e.Handled = $true }
+})
+$TxtIp.Add_TextChanged({
+    if ($script:SuppressIp) { return }
+    $raw   = $TxtIp.Text
+    $caret = $TxtIp.SelectionStart
+    $s = [regex]::Replace($raw, '[^\d.]', '')
+    $s = [regex]::Replace($s, '\.{2,}', '.')
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in ($s -split '\.')) {
+        if ($out.Count -ge 4) { break }
+        $oct = if ($p.Length -gt 3) { $p.Substring(0, 3) } else { $p }
+        if ($oct -ne '' -and [int]$oct -gt 255) { $oct = '255' }
+        $out.Add($oct)
+    }
+    $r = ($out -join '.')
+    if ($out.Count -lt 4 -and $out.Count -gt 0 -and $out[$out.Count - 1].Length -eq 3 -and -not $raw.EndsWith('.')) {
+        $r += '.'
+    }
+    if ($r -ne $raw) {
+        $delta = $r.Length - $raw.Length
+        $script:SuppressIp = $true
+        $TxtIp.Text = $r
+        $script:SuppressIp = $false
+        $TxtIp.SelectionStart = [Math]::Min([Math]::Max($caret + $delta, 0), $r.Length)
+    }
+})
 $y += 92 + 12
 
 # --- group: Peripherals and applications ---
 $gPer = New-Group 'Peripherals and applications' $gx $y $gw 118
 $py = 28
 $CmbPrinter = New-Combo
+# Type-to-filter: AutoComplete needs an editable DropDown (it is a no-op on DropDownList),
+# so override this combo only (leave New-Combo's default for the other combos).
+$CmbPrinter.DropDownStyle      = [System.Windows.Forms.ComboBoxStyle]::DropDown
+$CmbPrinter.AutoCompleteMode   = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
+$CmbPrinter.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
 $CmbPrinter.Items.Add('(None)') | Out-Null
 foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
 $CmbPrinter.SelectedIndex = 0
 $py = Add-Field $gPer 'Main printer' $CmbPrinter 16 $py
 $ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
-$ChkWebAgent.Text     = 'Install WebAgent'
+$ChkWebAgent.Text     = 'Will this PC use TOTVS? (downloads + installs WebAgent)'
 $ChkWebAgent.AutoSize = $true
 $ChkWebAgent.Location = New-Object System.Drawing.Point(16, $py)
-$Tip.SetToolTip($ChkWebAgent, 'Check to install the monitoring agent (WebAgent).')
+$Tip.SetToolTip($ChkWebAgent, 'Downloads and installs the WebAgent required to access TOTVS on this machine.')
 $gPer.Controls.Add($ChkWebAgent)
 $y += 118 + 12
 
@@ -587,14 +711,27 @@ $BtnOk.FlatAppearance.MouseDownBackColor  = [System.Drawing.Color]::FromArgb(0, 
 $BtnOk.Cursor    = [System.Windows.Forms.Cursors]::Hand
 $y += 38 + 16
 $BtnOk.Add_Click({
-    if (-not $TxtFullName.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Fill in the full name.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    # Aggregate ALL field errors into one message + per-field glyphs, instead of return-on-first.
+    $errs = [System.Collections.Generic.List[string]]::new()
+    $ErrProvider.Clear()
+    if ((Format-FullName $TxtFullName.Text) -eq '') {
+        $errs.Add('Full name: letters only (e.g. Joao Silva).')
+        $ErrProvider.SetError($TxtFullName, 'Letters and spaces only.')
     }
-    if (-not $TxtUsername.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Fill in the username.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    $un = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
+    if (-not (Test-Username $un)) {
+        $errs.Add('Username: must be name.surname (lowercase, no digits/spaces).')
+        $ErrProvider.SetError($TxtUsername, 'Format: name.surname')
     }
-    if ($RadioStatic.Checked -and -not $TxtIp.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Fill in the static IP.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    if ($RadioStatic.Checked -and -not (Test-Ipv4 $TxtIp.Text)) {
+        $errs.Add('Static IP: 4 octets 0-255 (e.g. 10.0.1.50).')
+        $ErrProvider.SetError($TxtIp, 'Invalid IPv4 address.')
+    }
+    if ($errs.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Please fix the following:`n`n - " + ($errs -join "`n - "),
+            'Setup - check the form', 'OK', 'Warning') | Out-Null
+        return
     }
     $Form.Tag = 'OK'
     $Form.Close()
@@ -660,14 +797,21 @@ if ($Form.Tag -ne 'OK') {
     exit 0
 }
 
-$FullName        = $TxtFullName.Text.Trim()
-$Username        = $TxtUsername.Text.Trim().ToLower()
+$FullName        = Format-FullName $TxtFullName.Text
+$Username        = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
 $EmailDomain     = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { $EmailDomains[0] }
 $Email           = "$Username@$EmailDomain"
 $UseStatic       = $RadioStatic.Checked
 $StaticIp        = if ($UseStatic) { $TxtIp.Text.Trim() } else { '' }
-$PrinterIdx      = $CmbPrinter.SelectedIndex
-$SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { $null }
+# Editable DropDown can return SelectedIndex -1 on free-typed text, so match by the stored
+# item text against the $Printers objects. Unrecognized text -> $null (no printer), which is safe.
+$printerText     = $CmbPrinter.Text.Trim()
+$SelectedPrinter = $null
+if ($printerText -and $printerText -ne '(None)') {
+    foreach ($p in $Printers) {
+        if ("$($p.name) - $($p.model) [$($p.ip)]" -eq $printerText) { $SelectedPrinter = $p; break }
+    }
+}
 $SectorName      = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
 $SigTemplate     = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
 $InstallWebAgent = $ChkWebAgent.Checked
@@ -699,6 +843,23 @@ $InstallWebAgent = $ChkWebAgent.Checked
 
     $SigTemplate     = '(Automatic - first found)'
     $InstallWebAgent = $TestWebAgent.IsPresent
+}
+
+# Final defensive validation - the single point both paths (GUI + headless -Test*) converge on.
+# The headless path builds these straight from parameters with no GUI validation, so re-check
+# here: a malformed -TestUsername aborts with a clear FATAL before any New-LocalUser.
+$FullName = Format-FullName $FullName
+$Username = (Remove-Diacritics $Username).Trim().ToLower()
+$Email    = "$Username@$EmailDomain"
+$capErrs  = [System.Collections.Generic.List[string]]::new()
+if (-not $FullName)                              { $capErrs.Add("Full name invalid/empty") }
+if (-not (Test-Username $Username))              { $capErrs.Add("Username not name.surname: '$Username'") }
+if ($UseStatic -and -not (Test-Ipv4 $StaticIp))  { $capErrs.Add("Static IP invalid: '$StaticIp'") }
+if ($capErrs.Count -gt 0) {
+    $m = "Input validation failed:`n - " + ($capErrs -join "`n - ")
+    Write-Log 'FATAL' $m
+    if ($useUI) { [System.Windows.Forms.MessageBox]::Show($m, 'Setup - invalid input', 'OK', 'Error') | Out-Null }
+    exit 1
 }
 
 # Launch the live progress window now (interactive only). From here, every Write-Log streams
@@ -749,6 +910,9 @@ try {
 
 # Local user
 try {
+    # Defense in depth at the use site: never create an account with an invalid name
+    # (spaces/digits/uppercase would produce a broken or wrong Windows account).
+    if ($Username -match '[^a-z.]') { throw "Refusing to create user with invalid name: '$Username'" }
     $SecPass = ConvertTo-SecureString $UserInitialPass -AsPlainText -Force
     if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
         Write-Log 'OK' "User already exists: $Username"
