@@ -542,6 +542,8 @@ $y = 82
 # Guards against TextChanged recursion when a handler programmatically sets .Text.
 $script:SuppressUser = $false
 $script:SuppressIp   = $false
+$script:SuppressFull = $false
+$script:IpPrevLen    = 0
 
 # --- group: User ---
 $gUser = New-Group 'User' $gx $y $gw 214
@@ -549,10 +551,30 @@ $py = 28
 $TxtFullName = New-TextBox
 $Tip.SetToolTip($TxtFullName, 'Name shown on the ticket. Becomes the user display name.')
 $py = Add-Field $gUser 'Full name (from the ticket)' $TxtFullName 16 $py $true
-# Normalize the display name (letters only, Title Case) when focus leaves the field.
+# Normalize the display name (Title Case) when focus leaves the field. Guarded so the
+# programmatic set does not re-enter the live sanitizer below.
 $TxtFullName.Add_Leave({
     $n = Format-FullName $TxtFullName.Text
-    if ($n -and $n -ne $TxtFullName.Text) { $TxtFullName.Text = $n }
+    if ($n -and $n -ne $TxtFullName.Text) {
+        $script:SuppressFull = $true
+        $TxtFullName.Text = $n
+        $script:SuppressFull = $false
+    }
+})
+# Live cleanup: block digits/symbols as you type, keeping letters, spaces, hyphen and
+# apostrophe (so 'Anne-Marie' and "O'Brien" survive - same char class as Format-FullName).
+# Title Case is applied on Leave/submit, not live (avoids fighting the cursor mid-word).
+$TxtFullName.Add_TextChanged({
+    if ($script:SuppressFull) { return }
+    $raw   = $TxtFullName.Text
+    $clean = [regex]::Replace($raw, "[^\p{L}\s\-']", '')
+    if ($clean -ne $raw) {
+        $caret = $TxtFullName.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressFull = $true
+        $TxtFullName.Text = $clean
+        $script:SuppressFull = $false
+        $TxtFullName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
 })
 $TxtUsername = New-TextBox
 $Tip.SetToolTip($TxtUsername, 'Windows login and email prefix. Use lowercase, e.g. joao.silva')
@@ -619,17 +641,33 @@ $RadioDhcp.Add_CheckedChanged({
     $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
     $LblNetHint.Visible = -not $RadioStatic.Checked })
 
-# IP input mask. KeyPress blocks non-digit/non-dot at the source (typing); TextChanged
-# also catches paste/programmatic. Auto-inserts a dot when an octet hits 3 digits, caps at
-# 4 octets, clamps each octet to 255. SuppressIp guards against TextChanged recursion.
+# IP input mask. KeyPress blocks non-digit/non-dot while typing; KeyDown makes Enter jump to
+# the next octet; TextChanged normalizes (also catches paste). The auto-dot fires only while
+# TYPING (not when deleting), so backspace can fix mistakes. SuppressIp guards recursion.
 $TxtIp.Add_KeyPress({ param($s, $e)
     if ([char]::IsControl($e.KeyChar)) { return }   # let backspace/delete through
     if ($e.KeyChar -ne '.' -and -not [char]::IsDigit($e.KeyChar)) { $e.Handled = $true }
+})
+# Enter = commit the current octet and jump to the next one (inserts the dot). SuppressKeyPress
+# stops the bell; there is no AcceptButton, so nothing gets submitted.
+$TxtIp.Add_KeyDown({ param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $e.SuppressKeyPress = $true; $e.Handled = $true
+        $t = $TxtIp.Text
+        if ($t -and -not $t.EndsWith('.') -and (($t -split '\.').Count -lt 4)) {
+            $script:SuppressIp = $true
+            $TxtIp.Text = "$t."
+            $script:SuppressIp = $false
+            $TxtIp.SelectionStart = $TxtIp.Text.Length
+            $script:IpPrevLen = $TxtIp.Text.Length
+        }
+    }
 })
 $TxtIp.Add_TextChanged({
     if ($script:SuppressIp) { return }
     $raw   = $TxtIp.Text
     $caret = $TxtIp.SelectionStart
+    $grew  = $raw.Length -gt $script:IpPrevLen   # typing grows; deleting shrinks -> no re-pad
     $s = [regex]::Replace($raw, '[^\d.]', '')
     $s = [regex]::Replace($s, '\.{2,}', '.')
     $out = [System.Collections.Generic.List[string]]::new()
@@ -640,7 +678,7 @@ $TxtIp.Add_TextChanged({
         $out.Add($oct)
     }
     $r = ($out -join '.')
-    if ($out.Count -lt 4 -and $out.Count -gt 0 -and $out[$out.Count - 1].Length -eq 3 -and -not $raw.EndsWith('.')) {
+    if ($grew -and $out.Count -lt 4 -and $out.Count -gt 0 -and $out[$out.Count - 1].Length -eq 3 -and -not $raw.EndsWith('.')) {
         $r += '.'
     }
     if ($r -ne $raw) {
@@ -650,6 +688,7 @@ $TxtIp.Add_TextChanged({
         $script:SuppressIp = $false
         $TxtIp.SelectionStart = [Math]::Min([Math]::Max($caret + $delta, 0), $r.Length)
     }
+    $script:IpPrevLen = $TxtIp.Text.Length
 })
 $y += 92 + 12
 
@@ -657,11 +696,8 @@ $y += 92 + 12
 $gPer = New-Group 'Peripherals and applications' $gx $y $gw 118
 $py = 28
 $CmbPrinter = New-Combo
-# Type-to-filter: AutoComplete needs an editable DropDown (it is a no-op on DropDownList),
-# so override this combo only (leave New-Combo's default for the other combos).
-$CmbPrinter.DropDownStyle      = [System.Windows.Forms.ComboBoxStyle]::DropDown
-$CmbPrinter.AutoCompleteMode   = [System.Windows.Forms.AutoCompleteMode]::SuggestAppend
-$CmbPrinter.AutoCompleteSource = [System.Windows.Forms.AutoCompleteSource]::ListItems
+# DropDownList (New-Combo default), same UX as the signature combos below: click the bar or
+# the arrow to open, type the first letter to jump, or scroll. Index 0 = (None).
 $CmbPrinter.Items.Add('(None)') | Out-Null
 foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
 $CmbPrinter.SelectedIndex = 0
@@ -715,21 +751,21 @@ $BtnOk.Add_Click({
     $errs = [System.Collections.Generic.List[string]]::new()
     $ErrProvider.Clear()
     if ((Format-FullName $TxtFullName.Text) -eq '') {
-        $errs.Add('Full name: letters only (e.g. Joao Silva).')
-        $ErrProvider.SetError($TxtFullName, 'Letters and spaces only.')
+        $errs.Add('Full name: letters and spaces only - hyphens and apostrophes are OK, but no digits or other symbols. Example: Joao Silva.')
+        $ErrProvider.SetError($TxtFullName, 'Letters and spaces only (hyphen/apostrophe OK, no digits).')
     }
     $un = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
     if (-not (Test-Username $un)) {
-        $errs.Add('Username: must be name.surname (lowercase, no digits/spaces).')
-        $ErrProvider.SetError($TxtUsername, 'Format: name.surname')
+        $errs.Add('Username must be firstname.surname - all lowercase, with a single dot between the two names, no numbers or spaces (example: joao.silva). It becomes the Windows login and the e-mail address, so it has to be exact.')
+        $ErrProvider.SetError($TxtUsername, 'Use firstname.surname (lowercase, one dot). Ex: joao.silva')
     }
     if ($RadioStatic.Checked -and -not (Test-Ipv4 $TxtIp.Text)) {
-        $errs.Add('Static IP: 4 octets 0-255 (e.g. 10.0.1.50).')
-        $ErrProvider.SetError($TxtIp, 'Invalid IPv4 address.')
+        $errs.Add('Static IP: four numbers from 0 to 255 separated by dots. Example: 10.0.1.50.')
+        $ErrProvider.SetError($TxtIp, 'Four numbers 0-255 with dots. Ex: 10.0.1.50')
     }
     if ($errs.Count -gt 0) {
         [System.Windows.Forms.MessageBox]::Show(
-            "Please fix the following:`n`n - " + ($errs -join "`n - "),
+            "Some fields need fixing before we can start:`n`n - " + ($errs -join "`n - "),
             'Setup - check the form', 'OK', 'Warning') | Out-Null
         return
     }
@@ -803,15 +839,9 @@ $EmailDomain     = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToStri
 $Email           = "$Username@$EmailDomain"
 $UseStatic       = $RadioStatic.Checked
 $StaticIp        = if ($UseStatic) { $TxtIp.Text.Trim() } else { '' }
-# Editable DropDown can return SelectedIndex -1 on free-typed text, so match by the stored
-# item text against the $Printers objects. Unrecognized text -> $null (no printer), which is safe.
-$printerText     = $CmbPrinter.Text.Trim()
-$SelectedPrinter = $null
-if ($printerText -and $printerText -ne '(None)') {
-    foreach ($p in $Printers) {
-        if ("$($p.name) - $($p.model) [$($p.ip)]" -eq $printerText) { $SelectedPrinter = $p; break }
-    }
-}
+# DropDownList: index 0 = (None); items 1..N map to $Printers[0..N-1].
+$PrinterIdx      = $CmbPrinter.SelectedIndex
+$SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { $null }
 $SectorName      = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
 $SigTemplate     = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
 $InstallWebAgent = $ChkWebAgent.Checked
@@ -852,7 +882,7 @@ $FullName = Format-FullName $FullName
 $Username = (Remove-Diacritics $Username).Trim().ToLower()
 $Email    = "$Username@$EmailDomain"
 $capErrs  = [System.Collections.Generic.List[string]]::new()
-if (-not $FullName)                              { $capErrs.Add("Full name invalid/empty") }
+if (-not $FullName)                              { $capErrs.Add("Full name has no usable letters: '$FullName'") }
 if (-not (Test-Username $Username))              { $capErrs.Add("Username not name.surname: '$Username'") }
 if ($UseStatic -and -not (Test-Ipv4 $StaticIp))  { $capErrs.Add("Static IP invalid: '$StaticIp'") }
 if ($capErrs.Count -gt 0) {

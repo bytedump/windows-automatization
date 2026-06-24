@@ -232,9 +232,10 @@ used by the Sandbox harness (no window).
 
 ### Error handling
 - **Input is validated and normalized before any action.** The form sanitizes as you type
-  (username forced to lowercase `name.surname`, accents stripped; the static IP field masks
-  to four `0-255` octets) and **blocks submit** with one consolidated message + per-field
-  markers if anything is still invalid. The same validators re-run at the single point where
+  (full name accepts letters/spaces/hyphen/apostrophe only; username forced to lowercase
+  `name.surname` with accents stripped; the static IP field masks to four `0-255` octets,
+  with Enter to jump between octets) and **blocks submit** with one consolidated, plain-language
+  message + per-field markers if anything is still invalid. The same validators re-run at the single point where
   the GUI and headless `-Test*` paths converge, so automation can't drive the script into a
   broken state (a malformed `-TestUsername` aborts `FATAL` before any account is created).
 - Every phase is wrapped in `try/catch`; failures are logged `ERROR`/`FATAL` and counted.
