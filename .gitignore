@@ -4,6 +4,10 @@ config.ps1
 # Resumo técnico interno (IPs/arquitetura/Yellow Hub/SIGA-TI) — repo é PÚBLICO, NUNCA commitar
 resumo-windows-auto.md
 
+# Harness de "ensaio real" (aponta pro pendrive real/local) — fica local, fora do repo público
+tests/prep-real.ps1
+tests/bootstrap-real.ps1
+
 # Impressoras reais (IPs/setores internos) — usar printers.example.json como base
 printers.json
 
