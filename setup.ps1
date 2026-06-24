@@ -154,6 +154,8 @@ function Wait-WindowClosed {
 # Builds the single window (form on top + live log at the bottom), wires the dynamic
 # combo events and the Start button, shows it modeless and pumps once. Reads $Printers,
 # $EmailDomains and $PathSignatures from the enclosing script scope (set before this runs).
+# IMPORTANT: this MUST be invoked dot-sourced ('. Show-MainWindow') so the control variables
+# land in the script scope and the event handlers can still see them when they fire later.
 function Show-MainWindow {
     $f = New-Object System.Windows.Forms.Form
     $f.Text            = 'New Machine Setup'
@@ -573,7 +575,12 @@ $useUI = (-not $Unattended) -and [System.Environment]::UserInteractive
 
 if ($useUI) {
     try {
-        Show-MainWindow
+        # DOT-SOURCED on purpose: '. Show-MainWindow' runs the function body in THIS (script)
+        # scope, so the control variables ($CmbDomain, $LblIp, ...) live at script scope. The
+        # form's event handlers fire later (after the function returns) on the message pump;
+        # if the controls were function-locals they'd be gone by then and every handler would
+        # throw "variable ... cannot be retrieved". Dot-sourcing keeps them reachable.
+        . Show-MainWindow
         while (-not $script:Started -and $script:UI -and -not $script:UI.Form.IsDisposed) {
             [System.Windows.Forms.Application]::DoEvents()
             [System.Threading.Thread]::Sleep(50)
