@@ -24,13 +24,21 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$TemplatePath = (Join-Path $PSScriptRoot 'autounattend.template.xml'),
-    [string]$OutPath      = (Join-Path $PSScriptRoot 'autounattend.xml'),
+    [string]$TemplatePath,
+    [string]$OutPath,
     [string]$AdminUser,
     [string]$AdminPassword
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Resolve the script's own folder. $PSScriptRoot can be EMPTY when referenced inside a
+# param() default (it is not always populated at parameter-binding time, e.g. launched via
+# `powershell -File`), which made Join-Path fail. Resolve it here in the body with a fallback
+# and default the paths from it instead of in the param block.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $TemplatePath) { $TemplatePath = Join-Path $ScriptDir 'autounattend.template.xml' }
+if (-not $OutPath)      { $OutPath      = Join-Path $ScriptDir 'autounattend.xml' }
 
 if (-not (Test-Path $TemplatePath)) {
     throw "Template not found: $TemplatePath"
