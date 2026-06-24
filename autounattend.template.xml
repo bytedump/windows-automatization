@@ -3,7 +3,7 @@
           xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
 
   <!-- ============================================================ -->
-  <!-- windowsPE: Locale + bypass TPM/SecureBoot + particionamento  -->
+  <!-- windowsPE: Locale + bypass TPM/SecureBoot + partitioning     -->
   <!-- ============================================================ -->
   <settings pass="windowsPE">
 
@@ -21,9 +21,9 @@
       <UserLocale>pt-BR</UserLocale>
     </component>
 
-    <!-- Bypass TPM/SecureBoot/RAM para PCs sem TPM 2.0 (Dell antigos).
-         Apenas estas 3 chaves LabConfig existem de fato; BypassCPUCheck/BypassStorageCheck
-         sao no-op (ignoradas pelo setup) e por isso nao estao aqui. -->
+    <!-- Bypass TPM/SecureBoot/RAM for PCs without TPM 2.0 (older Dells).
+         Only these 3 LabConfig keys actually exist; BypassCPUCheck/BypassStorageCheck
+         are no-ops (ignored by Setup) and therefore are not here. -->
     <component name="Microsoft-Windows-Deployment"
                processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35"
@@ -51,8 +51,8 @@
                language="neutral"
                versionScope="nonSxS">
 
-      <!-- Chave genérica Win 11 Pro — seleciona edição Pro, não ativa -->
-      <!-- Ativação via chave OEM do firmware UEFI (automática no Dell) -->
+      <!-- Generic Win 11 Pro key — selects the Pro edition, does not activate -->
+      <!-- Activation via the OEM key in the UEFI firmware (automatic on Dell) -->
       <UserData>
         <ProductKey>
           <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
@@ -61,28 +61,28 @@
         <AcceptEula>true</AcceptEula>
       </UserData>
 
-      <!-- GUARD DE DISCO: roda ANTES do DiskConfiguration (o wipe). A letra da USB nao
-           e' fixa no WinPE, entao varre as unidades procurando guard-disk.cmd e o executa.
-           Se houver >1 disco fixo, o .cmd desliga a maquina (wpeutil shutdown) antes do wipe.
-           Setup\RunSynchronous e' o unico RunSynchronous valido no windowsPE.
+      <!-- DISK GUARD: runs BEFORE DiskConfiguration (the wipe). The USB drive letter is
+           not fixed in WinPE, so it scans the drives looking for guard-disk.cmd and runs it.
+           If there is >1 fixed disk, the .cmd shuts the machine down (wpeutil shutdown) before the wipe.
+           Setup\RunSynchronous is the only valid RunSynchronous in windowsPE.
            ====================================================================
-           ATENCAO: a ordem RunSynchronous-vs-wipe NAO e' cravada pela Microsoft
-           (confianca media). TESTAR em VM com 2 discos ANTES de confiar em producao.
-           Se o install se comportar mal, este bloco e' o 1o a reverter. Em maquina de
-           1 disco e' inofensivo (o guard-disk.cmd so loga e segue). -->
+           WARNING: the RunSynchronous-vs-wipe ordering is NOT pinned down by Microsoft
+           (medium confidence). TEST in a VM with 2 disks BEFORE relying on it in production.
+           If the install misbehaves, this block is the first to revert. On a single-disk
+           machine it is harmless (guard-disk.cmd just logs and continues). -->
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
           <Path>cmd /c "for %i in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %i:\guard-disk.cmd call %i:\guard-disk.cmd"</Path>
-          <Description>Guard: aborta a instalacao se houver mais de 1 disco fixo</Description>
+          <Description>Guard: abort the installation if there is more than 1 fixed disk</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
 
-      <!-- GPT/UEFI: EFI (300MB) + MSR (16MB) + Windows (restante) -->
-      <!-- WillShowUI=OnError: pausa e mostra UI se o particionamento FALHAR.
-           NAO protege contra apagar o disco errado num cenario multi-disco (apagar
-           o Disk 0 errado nao gera "erro"). Premissa: a maquina-alvo tem 1 disco so.
-           A trava de ">1 disco" e' o RunSynchronous acima (guard-disk.cmd). -->
+      <!-- GPT/UEFI: EFI (300MB) + MSR (16MB) + Windows (remainder) -->
+      <!-- WillShowUI=OnError: pauses and shows UI if partitioning FAILS.
+           It does NOT protect against wiping the wrong disk in a multi-disk scenario
+           (wiping the wrong Disk 0 raises no "error"). Assumption: the target machine has
+           a single disk. The ">1 disk" guard is the RunSynchronous above (guard-disk.cmd). -->
       <DiskConfiguration>
         <WillShowUI>OnError</WillShowUI>
         <Disk wcm:action="add">
@@ -140,7 +140,7 @@
   </settings>
 
   <!-- ============================================================ -->
-  <!-- specialize: Locale + nome aleatório + BypassNRO              -->
+  <!-- specialize: Locale + random name + BypassNRO                 -->
   <!-- ============================================================ -->
   <settings pass="specialize">
 
@@ -163,10 +163,10 @@
       <ComputerName>*</ComputerName>
     </component>
 
-    <!-- Evita a tela "conecte a rede" no OOBE. Valido ate ~24H2 (build 26100);
-         a MS removeu o BypassNRO em builds Insider posteriores (26200+). Aqui e'
-         redundante: o oobeSystem ja pula o OOBE inteiro (SkipMachine/UserOOBE +
-         HideOnlineAccountScreens), entao a tela de rede nunca e' alcancada. -->
+    <!-- Avoids the "connect to a network" OOBE screen. Valid up to ~24H2 (build 26100);
+         MS removed BypassNRO in later Insider builds (26200+). It is redundant here:
+         oobeSystem already skips the entire OOBE (SkipMachine/UserOOBE +
+         HideOnlineAccountScreens), so the network screen is never reached. -->
     <component name="Microsoft-Windows-Deployment"
                processorArchitecture="amd64"
                publicKeyToken="31bf3856ad364e35"
@@ -183,7 +183,7 @@
   </settings>
 
   <!-- ============================================================ -->
-  <!-- oobeSystem: Skip OOBE, criar conta __ADMIN_USER__, autologon       -->
+  <!-- oobeSystem: Skip OOBE, create __ADMIN_USER__ account, autologon     -->
   <!-- ============================================================ -->
   <settings pass="oobeSystem">
 
@@ -209,8 +209,8 @@
             <Name>__ADMIN_USER__</Name>
             <Group>Administrators</Group>
             <Password>
-              <!-- O <Value> abaixo e' preenchido pelo build-usb.ps1 ao montar a USB
-                   (base64 de UTF-16 de SENHA + sufixo "Password", como o Windows espera). -->
+              <!-- The <Value> below is filled in by build-usb.ps1 when building the USB
+                   (base64 of UTF-16 of PASSWORD + "Password" suffix, as Windows expects). -->
               <Value>__ADMIN_PW_B64__</Value>
               <PlainText>false</PlainText>
             </Password>
@@ -225,23 +225,23 @@
           <Value>__ADMIN_PW_B64__</Value>
           <PlainText>false</PlainText>
         </Password>
-        <!-- LogonCount=1: o autologon vale por 1 boot. OK porque o setup.ps1
-             NAO reinicia a maquina no meio (reboot e' item manual do checklist).
-             Se algum dia o setup passar a reiniciar, subir este numero. -->
+        <!-- LogonCount=1: the autologon is valid for 1 boot. OK because setup.ps1
+             does NOT reboot the machine mid-run (reboot is a manual checklist item).
+             If setup ever starts rebooting, raise this number. -->
         <LogonCount>1</LogonCount>
       </AutoLogon>
 
-      <!-- Lanca o setup.ps1 do pendrive no primeiro logon (hands-free real).
-           A letra do USB nao e' deterministica, entao varre as unidades procurando
-           o drive que tem setup.ps1 E config.ps1 juntos (o payload real — evita pegar
-           um setup.ps1 solto em outro drive). No 1o logon o USB pode ainda nao ter
-           recebido letra, entao tenta por ~60s (30x2s). Se nao achar, avisa com
-           MessageBox (em vez de falhar calado). Roda em modo GUI (SEM -Unattended). -->
+      <!-- Launches setup.ps1 from the USB on first logon (real hands-free).
+           The USB drive letter is not deterministic, so it scans the drives looking for
+           the one that has setup.ps1 AND config.ps1 together (the real payload — avoids
+           picking up a stray setup.ps1 on another drive). On first logon the USB may not
+           have a letter yet, so it retries for ~60s (30x2s). If not found, it warns with a
+           MessageBox (instead of failing silently). Runs in GUI mode (NO -Unattended). -->
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1') -Wait } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Pendrive de setup nao encontrado (precisa setup.ps1 + config.ps1 na raiz). Reconecte o pendrive e rode run.bat manualmente.','Setup','OK','Error') | Out-Null }"</CommandLine>
-          <Description>Pos-provisionamento: abre o setup.ps1 (GUI) do pendrive</Description>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1') -Wait } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Setup USB not found (needs setup.ps1 + config.ps1 at the root). Reconnect the USB and run run.bat manually.','Setup','OK','Error') | Out-Null }"</CommandLine>
+          <Description>Post-provisioning: opens setup.ps1 (GUI) from the USB</Description>
           <RequiresUserInput>true</RequiresUserInput>
         </SynchronousCommand>
       </FirstLogonCommands>

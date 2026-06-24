@@ -3,10 +3,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# prep.ps1 — Prepara e abre o Windows Sandbox para teste
-# Executar no Windows (PowerShell nativo, NAO no WSL)
+# prep.ps1 — Prepares and opens Windows Sandbox for testing
+# Run on Windows (native PowerShell, NOT WSL)
 # ============================================================
-# Uso: powershell.exe -ExecutionPolicy Bypass -File prep.ps1
+# Usage: powershell.exe -ExecutionPolicy Bypass -File prep.ps1
 
 $repoRoot   = Split-Path $PSScriptRoot -Parent
 $stagingDir = "C:\SandboxTest"
@@ -15,40 +15,40 @@ $testsOut   = "$stagingDir\tests"
 
 Write-Host ""
 Write-Host "  ======================================" -ForegroundColor Cyan
-Write-Host "   PREPARANDO SANDBOX DE TESTE" -ForegroundColor Cyan
+Write-Host "   PREPARING THE TEST SANDBOX" -ForegroundColor Cyan
 Write-Host "  ======================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Repo origem : $repoRoot" -ForegroundColor Yellow
+Write-Host "  Source repo : $repoRoot" -ForegroundColor Yellow
 Write-Host "  Staging     : $stagingDir" -ForegroundColor Yellow
 Write-Host ""
 
-# --- Limpeza e recriação do staging ---
-Write-Host "  [1/4] Criando diretório de staging..." -ForegroundColor White
+# --- Clean up and recreate the staging dir ---
+Write-Host "  [1/4] Creating the staging directory..." -ForegroundColor White
 if (Test-Path $stagingDir) {
     Remove-Item $stagingDir -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $scriptsOut | Out-Null
 New-Item -ItemType Directory -Force -Path $testsOut  | Out-Null
 
-# --- Copiar scripts do repo (excluindo o que não deve ir pro USB simulado) ---
-Write-Host "  [2/4] Copiando scripts do repo..." -ForegroundColor White
+# --- Copy the repo scripts (excluding what must not reach the simulated USB) ---
+Write-Host "  [2/4] Copying the repo scripts..." -ForegroundColor White
 $excludeDirs = @('tests', '.git', 'automatizacaoCloud', 'assinatura-2026')
-$excludeFiles = @('config.ps1', 'printers.json')   # config.ps1: credenciais reais. printers.json: IPs internos de producao — o usb-sim traz a fixture de teste
+$excludeFiles = @('config.ps1', 'printers.json')   # config.ps1: real credentials. printers.json: internal production IPs — usb-sim ships the test fixture
 
 Get-ChildItem -Path $repoRoot | Where-Object {
     $_.Name -notin $excludeDirs -and $_.Name -notin $excludeFiles
 } | ForEach-Object {
     Copy-Item -Path $_.FullName -Destination $scriptsOut -Recurse -Force
-    Write-Host "        copiado: $($_.Name)" -ForegroundColor DarkGray
+    Write-Host "        copied: $($_.Name)" -ForegroundColor DarkGray
 }
 
-# --- Copiar fixtures de teste ---
-Write-Host "  [3/4] Copiando fixtures de teste..." -ForegroundColor White
+# --- Copy the test fixtures ---
+Write-Host "  [3/4] Copying the test fixtures..." -ForegroundColor White
 Copy-Item -Path "$PSScriptRoot\*" -Destination $testsOut -Recurse -Force
-Write-Host "        copiado: tests/" -ForegroundColor DarkGray
+Write-Host "        copied: tests/" -ForegroundColor DarkGray
 
-# --- Gerar sandbox.wsb com paths absolutos corretos ---
-Write-Host "  [4/4] Gerando sandbox.wsb..." -ForegroundColor White
+# --- Generate sandbox.wsb with the correct absolute paths ---
+Write-Host "  [4/4] Generating sandbox.wsb..." -ForegroundColor White
 $wsbContent = @"
 <Configuration>
   <MappedFolders>
@@ -71,14 +71,15 @@ $wsbContent = @"
 
 $wsbPath = "$stagingDir\sandbox.wsb"
 Set-Content -Path $wsbPath -Value $wsbContent -Encoding UTF8
-Write-Host "        gerado: $wsbPath" -ForegroundColor DarkGray
+Write-Host "        generated: $wsbPath" -ForegroundColor DarkGray
 
 Write-Host ""
-Write-Host "  Pronto! Abrindo Windows Sandbox..." -ForegroundColor Green
-Write-Host "  bootstrap.ps1 rodara automaticamente no login." -ForegroundColor Green
-Write-Host "  Preencha o formulario GUI quando aparecer." -ForegroundColor Green
+Write-Host "  Done! Opening Windows Sandbox..." -ForegroundColor Green
+Write-Host "  bootstrap.ps1 will run automatically on login." -ForegroundColor Green
+Write-Host "  It runs setup.ps1 -Unattended (headless, no GUI) and prints RESULT: PASSED/FAILED." -ForegroundColor Green
+Write-Host "  To SEE the GUI, run setup.ps1 WITHOUT -Unattended manually inside the Sandbox." -ForegroundColor Green
 Write-Host ""
-Write-Host "  Log do teste: C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt" -ForegroundColor Yellow
+Write-Host "  Test log: C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt" -ForegroundColor Yellow
 Write-Host ""
 
 Start-Process $wsbPath

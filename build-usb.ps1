@@ -1,26 +1,26 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Gera o autounattend.xml real a partir do autounattend.template.xml, injetando
-    o nome e a senha da conta admin bootstrap. Roda UMA vez, ao preparar o pendrive.
+    Generates the real autounattend.xml from autounattend.template.xml, injecting
+    the bootstrap admin account name and password. Run ONCE, when preparing the USB.
 
 .DESCRIPTION
-    O repositorio guarda so o TEMPLATE (com placeholders __ADMIN_USER__ /
-    __ADMIN_PW_B64__) — nenhum segredo e' versionado. Este script preenche os
-    placeholders e grava o autounattend.xml na raiz da USB. O arquivo gerado tem a
-    senha (base64) e por isso esta no .gitignore — NUNCA commitar.
+    The repository ships only the TEMPLATE (with __ADMIN_USER__ / __ADMIN_PW_B64__
+    placeholders) — no secret is versioned. This script fills the placeholders and
+    writes autounattend.xml to the USB root. The generated file holds the password
+    (base64), so it is in .gitignore — NEVER commit it.
 
-    A senha do autounattend e' so de BOOTSTRAP: o setup.ps1 a troca no 1o login pela
-    senha real do config.ps1. O NOME informado aqui DEVE bater com $AdminAccount no
-    config.ps1 (o setup.ps1 usa esse nome pra trocar a senha).
+    The autounattend password is BOOTSTRAP only: setup.ps1 rotates it on first login
+    to the real password from config.ps1. The NAME entered here MUST match
+    $AdminAccount in config.ps1 (setup.ps1 uses that name to rotate the password).
 
 .EXAMPLE
     .\build-usb.ps1
-    # Pergunta nome e senha interativamente, gera .\autounattend.xml
+    # Prompts for name and password interactively, generates .\autounattend.xml
 
 .EXAMPLE
     .\build-usb.ps1 -AdminUser setupadmin -OutPath E:\autounattend.xml
-    # Pergunta so a senha (escondida), grava direto na raiz do pendrive (E:)
+    # Prompts only for the password (hidden), writes straight to the USB root (E:)
 #>
 [CmdletBinding()]
 param(
@@ -33,43 +33,43 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path $TemplatePath)) {
-    throw "Template nao encontrado: $TemplatePath"
+    throw "Template not found: $TemplatePath"
 }
 
-# --- Nome da conta ---
+# --- Account name ---
 if (-not $AdminUser) {
-    $AdminUser = (Read-Host 'Nome da conta admin bootstrap (ex: setupadmin)').Trim()
+    $AdminUser = (Read-Host 'Bootstrap admin account name (e.g. setupadmin)').Trim()
 }
-if (-not $AdminUser) { throw 'Nome da conta nao pode ser vazio.' }
+if (-not $AdminUser) { throw 'Account name cannot be empty.' }
 
-# --- Senha (escondida; convertida pra texto so o tempo de gerar o base64) ---
+# --- Password (hidden; converted to plain text only long enough to build the base64) ---
 if (-not $AdminPassword) {
-    $sec  = Read-Host 'Senha da conta admin bootstrap' -AsSecureString
+    $sec  = Read-Host 'Bootstrap admin account password' -AsSecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
     try   { $AdminPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
-if (-not $AdminPassword) { throw 'Senha nao pode ser vazia.' }
+if (-not $AdminPassword) { throw 'Password cannot be empty.' }
 
-# O Windows espera o valor em base64 de UTF-16LE de (senha + sufixo "Password"),
-# tanto p/ LocalAccount quanto p/ AutoLogon. Mesmo valor nos dois lugares.
+# Windows expects the value as base64 of UTF-16LE of (password + "Password" suffix),
+# for both LocalAccount and AutoLogon. Same value in both places.
 $pwB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($AdminPassword + 'Password'))
 
 $xml = Get-Content -Path $TemplatePath -Raw -Encoding UTF8
 $xml = $xml.Replace('__ADMIN_USER__', $AdminUser).Replace('__ADMIN_PW_B64__', $pwB64)
 
 if ($xml -match '__ADMIN_USER__|__ADMIN_PW_B64__') {
-    throw 'Sobrou placeholder nao substituido no XML — abortando.'
+    throw 'An unreplaced placeholder remains in the XML - aborting.'
 }
 
-# UTF-8 sem BOM (autounattend espera UTF-8).
+# UTF-8 without BOM (autounattend expects UTF-8).
 [System.IO.File]::WriteAllText($OutPath, $xml, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host ""
-Write-Host "OK: autounattend.xml gerado em $OutPath" -ForegroundColor Green
-Write-Host "Conta bootstrap: $AdminUser" -ForegroundColor Green
+Write-Host "OK: autounattend.xml generated at $OutPath" -ForegroundColor Green
+Write-Host "Bootstrap account: $AdminUser" -ForegroundColor Green
 Write-Host ""
-Write-Host "LEMBRETES:" -ForegroundColor Yellow
-Write-Host "  - No config.ps1, \$AdminAccount DEVE ser '$AdminUser'." -ForegroundColor Yellow
-Write-Host "  - O autounattend.xml gerado tem a senha — NUNCA commitar (ja esta no .gitignore)." -ForegroundColor Yellow
-Write-Host "  - Esta e' a senha BOOTSTRAP; o setup.ps1 troca pela real (\$AdminNewPass) no 1o login." -ForegroundColor Yellow
+Write-Host "REMINDERS:" -ForegroundColor Yellow
+Write-Host "  - In config.ps1, \$AdminAccount MUST be '$AdminUser'." -ForegroundColor Yellow
+Write-Host "  - The generated autounattend.xml holds the password - NEVER commit it (already in .gitignore)." -ForegroundColor Yellow
+Write-Host "  - This is the BOOTSTRAP password; setup.ps1 rotates it to the real one (\$AdminNewPass) on first login." -ForegroundColor Yellow

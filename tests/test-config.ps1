@@ -1,22 +1,22 @@
-﻿# ============================================================
-# test-config.ps1 — Configuração FAKE para testes no Sandbox
-# Substitui o config.ps1 real (credenciais falsas, sem risco)
+# ============================================================
+# test-config.ps1 — FAKE configuration for Sandbox testing
+# Replaces the real config.ps1 (fake credentials, no risk)
 # ============================================================
 
-# --- Credenciais locais (falsas) ---
+# --- Local credentials (fake) ---
 $AdminAccount    = 'setupadmin'
-$AdminNewPass    = "Teste@Sandbox2024!"
-$UserInitialPass = "Teste@Sandbox2024!"
+$AdminNewPass    = "Test@Sandbox2024!"
+$UserInitialPass = "Test@Sandbox2024!"
 
-# --- Domínios disponíveis no formulário ---
+# --- Domains available in the form ---
 $EmailDomains = @('empresa.com.br')
 
-# --- Share (não existe — setup.ps1 vai logar WARN e continuar) ---
+# --- Share (does not exist — setup.ps1 will log WARN and continue) ---
 $SharePath   = ""
 $ShareUser   = ""
 $SharePass   = ""
 
-# --- IP estático ---
+# --- Static IP ---
 $StaticGateway      = "192.168.1.1"
 $StaticPrefixLength = 24
 $DnsServers         = @('8.8.8.8', '8.8.4.4')
@@ -24,12 +24,12 @@ $DnsServers         = @('8.8.8.8', '8.8.4.4')
 # --- Wallpaper ---
 $WallpaperFile = 'wallpaper.jpg'
 
-# --- WiFi (não existe no Sandbox — setup.ps1 vai logar WARN e continuar) ---
-$WifiSSID = "RedeTesteSandbox"
-$WifiPass = "SenhaWifiFake@2024!"
+# --- WiFi (does not exist in the Sandbox — setup.ps1 will log WARN and continue) ---
+$WifiSSID = "SandboxTestNetwork"
+$WifiPass = "FakeWifiPass@2024!"
 
-# --- Paths (relativos ao $ScriptDir = raiz do USB simulado) ---
-# $ScriptDir é definido pelo setup.ps1 antes de dot-source este arquivo
+# --- Paths (relative to $ScriptDir = simulated USB root) ---
+# $ScriptDir is set by setup.ps1 before dot-sourcing this file
 $PathOffice     = "$ScriptDir\Office"
 $PathBelarc     = $ScriptDir
 $PathEpson      = "$ScriptDir\Drivers Epson"
