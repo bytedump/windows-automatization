@@ -19,6 +19,7 @@ repo ships **templates**; you fill them in once when you build the master USB.
 - [2. setup.ps1](#2-setupps1)
 - [3. Full flow](#3-full-flow)
 - [4. How to test](#4-how-to-test)
+- [Troubleshooting](#troubleshooting)
 - [5. Repository files](#5-repository-files)
 
 ## Overview
@@ -34,6 +35,25 @@ repo ships **templates**; you fill them in once when you build the master USB.
 ## Preparing the master USB
 
 Done **once** per master USB. The per-machine boot afterwards is fully hands-free.
+
+### Burning the boot USB (Rufus)
+
+The USB must first be a **bootable Windows 11 installer**. Burn the ISO with
+[Rufus](https://rufus.ie) (GPT / UEFI), then copy the repo payload onto its root. Two
+things matter:
+
+> **Use an ISO whose language matches the answer file (pt-BR).** `autounattend.xml` requests
+> `UILanguage = pt-BR`; an **English (en-US) ISO does not ship the pt-BR language pack** in
+> `boot.wim`, so Setup cannot apply it and **stops on the language/keyboard screen** for a
+> manual pick. Download the **Windows 11 Portuguese (Brazil)** multi-edition ISO from Microsoft.
+
+> **Leave every box unchecked in Rufus's "Customize Windows installation experience" /
+> "Windows User Experience" dialog.** Ticking any of them makes Rufus write its **own**
+> `autounattend.xml` to the USB root, which sits higher in Setup's search order and
+> **overrides ours**. Our `autounattend.xml` already handles the TPM/Secure Boot/RAM bypass
+> (via `LabConfig`) and the local account, so no Rufus customization is needed.
+
+Copy the repo payload **after** Rufus finishes (the steps below write to the USB root).
 
 1. **Copy the repo files** to the USB root (or a staging folder you copy to the USB).
 2. **Generate `autounattend.xml`** from the template — this bakes in the bootstrap admin
@@ -148,7 +168,7 @@ opens automatically via `FirstLogonCommands`.
 
 | Screen | Mechanism |
 |---|---|
-| Language / Region / Keyboard | `SetupUILanguage`, `InputLocale` |
+| Language / Region / Keyboard | `SetupUILanguage`, `InputLocale` — **only with a matching-language ISO (pt-BR)**; on 24H2/25H2 the new "ConX" setup may still show them. See [Troubleshooting](#troubleshooting). |
 | Product key | Generic Pro key `VK7JG-NPHTM-C97JM-9MPGT-3V66T` (selects edition, does not activate) |
 | EULA | `<AcceptEula>true</AcceptEula>` |
 | Disk / partition | `DiskConfiguration` with `WillWipeDisk=true` |
@@ -422,6 +442,46 @@ Generate the file first (`build-usb.ps1`), then:
 
 ---
 
+## Troubleshooting
+
+### Windows 11 24H2/25H2 — initial language/keyboard screens
+
+**Symptom:** Setup stops on the language/region and keyboard screens (two manual "Next"
+clicks) before the install becomes automatic. *(The disk-guard `cmd` console that flashes
+in WinPE is **expected** — a `RunSynchronous` command shows a console — not the problem.)*
+
+**Cause:** two independent triggers produce the same symptom:
+
+1. **ISO language ≠ pt-BR** — an en-US ISO has no pt-BR pack in `boot.wim`, so
+   `SetupUILanguage` cannot apply. **Fix:** burn a **pt-BR ISO** (see
+   [Burning the boot USB](#burning-the-boot-usb-rufus)). This is the usual cause.
+2. **24H2/25H2 "ConX" setup** — since 24H2, WinPE launches the new `SetupPrep.exe`
+   front-end, which can ignore the `windowsPE` locale settings **even on a matching ISO**.
+
+**Fix for the ConX case — force the legacy setup.** Edit the media's `boot.wim` (index 2 =
+"Windows Setup") so WinPE launches the old `setup.exe`, which honours the whole `windowsPE`
+pass. Run `force-legacy-setup.ps1` from an **Administrator** PowerShell on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\force-legacy-setup.ps1 -UsbDrive E   # E: = the USB
+```
+
+Or by hand (the script just wraps these):
+
+```powershell
+DISM /Mount-Wim /WimFile:E:\sources\boot.wim /Index:2 /MountDir:C:\mnt
+reg load HKLM\OFFSYS C:\mnt\Windows\System32\config\SYSTEM
+reg add HKLM\OFFSYS\Setup /v CmdLine /t REG_SZ /d "X:\sources\setup.exe" /f
+reg unload HKLM\OFFSYS
+DISM /Unmount-Wim /MountDir:C:\mnt /Commit
+```
+
+> ⚠️ Community-reported, **medium confidence — test in a VM first** (same caution as the
+> disk guard). `boot.wim` is < 4 GB so it fits the FAT32 USB; the script clears its
+> read-only attribute automatically if Rufus set one.
+
+---
+
 ## 5. Repository files
 
 | File | Description |
@@ -429,6 +489,7 @@ Generate the file first (`build-usb.ps1`), then:
 | `autounattend.template.xml` | Answer-file template (placeholders for admin user/password) |
 | `build-usb.ps1` | Generates the real `autounattend.xml` from the template (one-time, at USB build) |
 | `build.bat` | Double-click launcher for `build-usb.ps1` (ExecutionPolicy Bypass; stays open) |
+| `force-legacy-setup.ps1` | Forces legacy Setup on the boot USB (24H2/25H2 ConX fix; run as admin, test in VM) |
 | `setup.ps1` | Post-installation script with GUI |
 | `run.bat` | Manual fallback launcher (ExecutionPolicy Bypass) |
 | `guard-disk.cmd` | WinPE guard: aborts install if >1 fixed disk (test in VM first) |
