@@ -1,11 +1,17 @@
 #Requires -Version 5.1
+param(
+    # By default setup.ps1 runs INTERACTIVELY (the GUI, production-like). Pass -Headless for
+    # the automated assertion path: setup.ps1 -Unattended with test data, no GUI.
+    [switch]$Headless
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ============================================================
 # bootstrap.ps1 - Runs INSIDE Windows Sandbox at login
-# Simulates a USB drive and runs setup.ps1 in an isolated environment
+# Simulates a USB drive and runs setup.ps1 in an isolated environment.
+# Default: interactive (production-like GUI). -Headless: automated assertion.
 # ============================================================
 
 $usbDir = "C:\USB"
@@ -63,8 +69,8 @@ if (-not (Get-LocalUser -Name 'setupadmin' -ErrorAction SilentlyContinue)) {
     Write-Host "        setupadmin created" -ForegroundColor DarkGray
 }
 
-# --- Run setup.ps1 in -Unattended mode (headless: no GUI blocking the test) ---
-Write-Host "  [4/4] Running setup.ps1 -Unattended..." -ForegroundColor White
+# --- Run setup.ps1 (interactive GUI by default; -Headless for the automated assertion) ---
+Write-Host "  [4/4] Running setup.ps1$(if ($Headless) { ' -Unattended (headless)' } else { ' (interactive GUI - production-like)' })..." -ForegroundColor White
 Write-Host ""
 
 # Ensure UTF-8 BOM in setup.ps1 so PowerShell 5.1 parses it correctly
@@ -77,8 +83,16 @@ $raw = [System.IO.File]::ReadAllText($setupFile, [System.Text.Encoding]::UTF8)
 [System.IO.File]::WriteAllText($setupFile, $raw, (New-Object System.Text.UTF8Encoding $true))
 
 Set-Location $usbDir
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setupFile `
-    -Unattended -TestFullName 'Test User' -TestUsername 'test.user'
+if ($Headless) {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setupFile `
+        -Unattended -TestFullName 'Test User' -TestUsername 'test.user'
+} else {
+    # Production-like: the GUI appears. Fill it with the test fixtures and click Start:
+    #   email domain = empresa.com.br | sector = TI | printer = Test Printer
+    Write-Host "  Fill the GUI (domain empresa.com.br, sector TI, printer 'Test Printer') and click Start." -ForegroundColor DarkGray
+    Write-Host ""
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setupFile
+}
 $setupExit = $LASTEXITCODE
 
 # --- Evaluate the result: exit code + count of [ERROR]/[FATAL] in the log (the real assertion) ---

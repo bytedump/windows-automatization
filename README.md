@@ -358,18 +358,20 @@ Runs `setup.ps1` in a throwaway VM that resets on close. No risk to the host.
    ```
 2. `prep.ps1` stages the scripts, injects fake credentials (`test-config.ps1`), opens the Sandbox.
 3. `bootstrap.ps1` runs automatically on login: pre-creates the admin account, then runs
-   `setup.ps1 -Unattended` (headless) with test data.
+   `setup.ps1` **interactively** — the production-like single-window GUI. Fill the form with
+   the test fixtures (domain `empresa.com.br`, sector `TI`, printer `Test Printer`) and click
+   Start; the bottom section streams every task live.
 4. Read the verdict: **`RESULT: PASSED`** (exit 0, zero `ERROR`/`FATAL`) or **`FAILED`**.
    Full log on the Sandbox Desktop.
 5. Close the Sandbox → everything is discarded.
 
 **Expected WARNs (not failures):** WiFi (no adapter), SMB share (fake path),
-Office/Ninite/Belarc/Epson (binaries absent) — logged WARN, not `ERROR`.
+Office/Ninite/Belarc/Epson (binaries absent), OEM activation (no firmware key in a VM) —
+logged WARN, not `ERROR`.
 
-**See the GUI:** the automated run is headless (`-Unattended`, no window). To watch the
-single-window GUI (form on top + live progress at the bottom) in the Sandbox, run `setup.ps1`
-**without** `-Unattended` manually inside it:
-`powershell -ExecutionPolicy Bypass -File C:\USB\setup.ps1`.
+**Headless assertion:** for an automated, no-GUI run (CI-style), use
+`bootstrap.ps1 -Headless` — it runs `setup.ps1 -Unattended` with test data and prints the
+verdict without any interaction.
 
 **Test fixtures:**
 | File | Purpose |

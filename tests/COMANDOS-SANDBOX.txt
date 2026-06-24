@@ -3,8 +3,10 @@
 ========================================
 
 Flow: STEP 0 (on Windows) opens the Sandbox. Inside it, bootstrap.ps1 RUNS BY
-ITSELF at login: pre-creates setupadmin -> runs setup.ps1 -Unattended (headless,
-no GUI) -> at the end prints  RESULT: PASSED / FAILED.
+ITSELF at login: pre-creates setupadmin -> runs setup.ps1 INTERACTIVELY (the GUI,
+production-like) -> at the end prints  RESULT: PASSED / FAILED.
+Fill the GUI with the test fixtures: domain empresa.com.br, sector TI, printer
+'Test Printer'. For the headless automated assertion (no GUI), use -Headless.
 STEPS 1-3 are only needed to RE-RUN it by hand inside the Sandbox.
 
 
@@ -36,7 +38,11 @@ Open PowerShell: Win+R -> powershell -> Enter
  STEP 1 — Re-run the test manually
 ----------------------------------------
 
+# Interactive (default, production-like GUI):
 powershell -ExecutionPolicy Bypass -File C:\Tests\bootstrap.ps1
+
+# Headless (automated assertion, no GUI):
+powershell -ExecutionPolicy Bypass -File C:\Tests\bootstrap.ps1 -Headless
 
 
 ----------------------------------------
@@ -48,11 +54,11 @@ $f = "C:\USB\setup.ps1"; $raw = [System.IO.File]::ReadAllText($f, [System.Text.E
 
 
 ----------------------------------------
- STEP 2b — See the GUI (instead of headless)
+ STEP 2b — Run setup.ps1 directly (skip bootstrap's re-prep)
 ----------------------------------------
 
-# Run setup.ps1 WITHOUT -Unattended to show the single-window GUI
-# (form on top + live progress section at the bottom):
+# bootstrap already staged C:\USB. To re-run only setup.ps1 (single-window GUI:
+# form on top + live progress at the bottom), without re-prepping:
 powershell -ExecutionPolicy Bypass -File C:\USB\setup.ps1
 
 

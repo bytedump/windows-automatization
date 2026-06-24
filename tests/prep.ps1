@@ -76,8 +76,9 @@ Write-Host "        generated: $wsbPath" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  Done! Opening Windows Sandbox..." -ForegroundColor Green
 Write-Host "  bootstrap.ps1 will run automatically on login." -ForegroundColor Green
-Write-Host "  It runs setup.ps1 -Unattended (headless, no GUI) and prints RESULT: PASSED/FAILED." -ForegroundColor Green
-Write-Host "  To SEE the GUI, run setup.ps1 WITHOUT -Unattended manually inside the Sandbox." -ForegroundColor Green
+Write-Host "  By default it runs setup.ps1 INTERACTIVELY (the GUI, production-like): fill the" -ForegroundColor Green
+Write-Host "  form and click Start; at the end it prints RESULT: PASSED/FAILED." -ForegroundColor Green
+Write-Host "  For the headless automated assertion instead, run: bootstrap.ps1 -Headless" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Test log: C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt" -ForegroundColor Yellow
 Write-Host ""
