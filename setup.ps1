@@ -449,7 +449,10 @@ try {
         Write-Log 'WARN' "No OEM key found in the UEFI firmware"
     }
 } catch {
-    Write-Log 'ERROR' "OEM activation: $($_.Exception.Message)"
+    # Activation is best-effort and never blocks provisioning (the machine works
+    # unactivated). A sandbox/VM has no firmware OEM key, so this WARNs rather than ERRORs
+    # to avoid failing the whole run on a non-critical step. Verify activation in the checklist.
+    Write-Log 'WARN' "OEM activation skipped/failed: $($_.Exception.Message)"
 }
 
 # Rotate the admin account bootstrap password ($AdminAccount, created by autounattend)
@@ -908,6 +911,7 @@ PC name  : $env:COMPUTERNAME
 
 PENDING:
 [ ] REBOOT to apply the new PC name
+[ ] Confirm Windows activation (slmgr /xpr) - OEM activation is best-effort
 [ ] Register the machine on the intranet
 [ ] Office 365 login: $Email
 [ ] Verify the signature in Outlook
