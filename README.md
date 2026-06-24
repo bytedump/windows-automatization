@@ -417,10 +417,14 @@ Runs `setup.ps1` in a throwaway VM that resets on close. No risk to the host.
 (Control Panel → Programs → Windows Features → Windows Sandbox).
 
 **Steps:**
-1. Open PowerShell on **Windows** (not WSL), from the repo's `tests/` folder:
+1. Launch the prep (path-agnostic — works wherever the repo lives, WSL share or a
+   normal Windows folder). Either **double-click `tests\run-sandbox.bat`** (it
+   self-elevates with a UAC prompt), or from an **Administrator** PowerShell in the
+   repo's `tests/` folder run:
    ```powershell
    powershell.exe -ExecutionPolicy Bypass -File .\prep.ps1
    ```
+   Admin is needed because `prep.ps1` creates `C:\SandboxTest` at the root of `C:`.
 2. `prep.ps1` stages the scripts, injects fake credentials (`test-config.ps1`), opens the Sandbox.
 3. `bootstrap.ps1` runs automatically on login: pre-creates the admin account, then runs
    `setup.ps1` **interactively** — the production-like single-window GUI. Fill the form with
@@ -441,6 +445,7 @@ verdict without any interaction.
 **Test fixtures:**
 | File | Purpose |
 |---|---|
+| `tests/run-sandbox.bat` | One-click launcher — self-elevating, path-agnostic; runs `prep.ps1` |
 | `tests/prep.ps1` | Staging + WSB generator — run on Windows before Sandbox |
 | `tests/bootstrap.ps1` | Runs automatically inside Sandbox at login |
 | `tests/test-config.ps1` | Fake credentials replacing `config.ps1` |

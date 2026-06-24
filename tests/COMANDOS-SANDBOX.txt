@@ -17,12 +17,25 @@ STEPS 1-3 are only needed to RE-RUN it by hand inside the Sandbox.
 Prerequisite (once): Windows Sandbox enabled
   Turn Windows features on/off -> Windows Sandbox -> reboot
 
-Open PowerShell AS ADMINISTRATOR (creates C:\SandboxTest at the root of C:):
-  Win+X -> "Terminal (Admin)" or "PowerShell (Admin)"
+These commands are PATH-AGNOSTIC: they work no matter where this repo lives
+(a WSL share \\wsl.localhost\<distro>\... or a normal Windows folder such as
+C:\projects\...). prep.ps1 locates itself ($PSScriptRoot), so you never edit a path.
 
-Run prep (copies everything, generates the .wsb and opens the Sandbox):
+EASIEST - just double-click:
+  tests\run-sandbox.bat
+  (it auto-elevates with a UAC prompt and runs prep.ps1 next to it)
 
-powershell -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu\home\<your-user>\githubProjects\windows-automatization\tests\prep.ps1"
+MANUAL - from an ADMIN PowerShell (admin: it creates C:\SandboxTest at C: root):
+  Win+X -> "Terminal (Admin)" or "PowerShell (Admin)", then:
+
+  # A) you are already INSIDE the tests folder (File Explorer -> address bar -> type: powershell):
+  powershell -ExecutionPolicy Bypass -File .\prep.ps1
+
+  # B) from anywhere, point at the .bat by full path (drag the file into the window to autofill it):
+  powershell -ExecutionPolicy Bypass -File "<full-path-to>\tests\prep.ps1"
+
+  TIP: dragging run-sandbox.bat (or prep.ps1) from Explorer into the terminal
+       pastes its exact full path - no typing, works for any user/distro/folder.
 
 -> The Sandbox opens and bootstrap.ps1 runs by itself. Read the RESULT at the end.
 
