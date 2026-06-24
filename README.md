@@ -193,9 +193,12 @@ is not fixed, so the command scans drives for `guard-disk.cmd`.
 ## 2. setup.ps1
 
 ### What it does
-PowerShell + Windows Forms GUI. Auto-launched by `autounattend.xml` on first login;
-`run.bat` is the manual fallback. Supports `-Unattended` (with `-Test*` parameters) for
-headless testing — used by the Sandbox harness.
+PowerShell + Windows Forms GUI in a **single window**: the input form on top and a live
+progress section at the bottom (status + progress bar + colored streaming log) that shows
+each task — rename, user, network, installers, signature — as it runs, with a **Close**
+button when finished. Auto-launched by `autounattend.xml` on first login; `run.bat` is the
+manual fallback. Supports `-Unattended` (with `-Test*` parameters) for headless testing —
+used by the Sandbox harness (no window).
 
 ### Error handling
 - Every phase is wrapped in `try/catch`; failures are logged `ERROR`/`FATAL` and counted.
@@ -255,8 +258,9 @@ Phase 1 — Load config.ps1; apply OEM license (slmgr); rotate the bootstrap adm
     ↓
 Phase 2 — WiFi (WPA2PSK), map the corporate share, load printers.json
     ↓
-Phase 3 — GUI: full name, username, email domain, network (DHCP/Static IP), printer,
-          sector, signature .htm, WebAgent checkbox
+Phase 3 — GUI (single window): the input form (full name, username, email domain, network
+          DHCP/Static IP, printer, sector, signature .htm, WebAgent) on top, plus a live
+          progress section at the bottom that streams every task below as it runs
     ↓
 Phase 4 — Rename PC to BIOS SerialNumber; create local user; configure Ethernet; wallpaper
     ↓
@@ -329,7 +333,7 @@ manual checklist item.
 6.  [AUTO] AutoLogon as the bootstrap admin (one time)
 7.  [AUTO] setup.ps1 opens automatically (FirstLogonCommands) — run.bat is the manual fallback
 8.  [AUTO] OEM license applied + bootstrap admin password rotated
-9.  [INTERACTIVE] GUI — technician fills name, username, domain, network, printer, sector
+9.  [INTERACTIVE] GUI (single window) — technician fills name/username/domain/network/printer/sector; the bottom section then streams steps 10-12 live
 10. [AUTO] PC renamed, user created, network + wallpaper configured
 11. [AUTO] Ninite + Office + Belarc + Epson installed in parallel; WebAgent after
 12. [AUTO] Outlook signature created; checklist shown + saved to Desktop
@@ -355,12 +359,17 @@ Runs `setup.ps1` in a throwaway VM that resets on close. No risk to the host.
 2. `prep.ps1` stages the scripts, injects fake credentials (`test-config.ps1`), opens the Sandbox.
 3. `bootstrap.ps1` runs automatically on login: pre-creates the admin account, then runs
    `setup.ps1 -Unattended` (headless) with test data.
-4. Read the verdict: **`RESULTADO: PASSOU`** (exit 0, zero `ERROR`/`FATAL`) or **`FALHOU`**.
+4. Read the verdict: **`RESULT: PASSED`** (exit 0, zero `ERROR`/`FATAL`) or **`FAILED`**.
    Full log on the Sandbox Desktop.
 5. Close the Sandbox → everything is discarded.
 
 **Expected WARNs (not failures):** WiFi (no adapter), SMB share (fake path),
 Office/Ninite/Belarc/Epson (binaries absent) — logged WARN, not `ERROR`.
+
+**See the GUI:** the automated run is headless (`-Unattended`, no window). To watch the
+single-window GUI (form on top + live progress at the bottom) in the Sandbox, run `setup.ps1`
+**without** `-Unattended` manually inside it:
+`powershell -ExecutionPolicy Bypass -File C:\USB\setup.ps1`.
 
 **Test fixtures:**
 | File | Purpose |
