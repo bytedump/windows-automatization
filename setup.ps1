@@ -1,8 +1,8 @@
 ﻿#Requires -Version 5.1
 param(
     [switch]$Unattended,
-    [string]$TestFullName  = 'Teste Usuario',
-    [string]$TestUsername  = 'teste.usuario',
+    [string]$TestFullName  = 'Test User',
+    [string]$TestUsername  = 'test.user',
     [string]$TestDomain    = '',
     [string]$TestSector    = '',
     [switch]$TestStaticIp,
@@ -13,9 +13,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# setup.ps1 — Windows 11 Setup
-# Executado automaticamente pelo autounattend.xml no primeiro login
-# Requer: config.ps1 na raiz do pendrive (gitignored, nunca commitar)
+# setup.ps1 - Windows 11 Setup
+# Run automatically by autounattend.xml on the first login
+# Requires: config.ps1 at the USB root (gitignored, never commit)
 # ============================================================
 
 $LogFile      = "$env:USERPROFILE\Desktop\win11_setup_log.txt"
@@ -31,76 +31,404 @@ function Write-Log {
     if ($Level -in 'ERROR', 'FATAL') {
         $script:Erros.Add("[$Level] $Msg") | Out-Null
     }
-}
 
-# Avalia o exit code de um instalador e loga OK/ERROR (em vez de assumir OK).
-# 3010 (reboot required) conta como sucesso para MSI.
-function Write-ProcResult {
-    param([string]$Name, $Proc, [int[]]$OkCodes = @(0))
-    if ($null -eq $Proc) { Write-Log 'ERROR' "${Name}: processo nao iniciou"; return }
-    if ($OkCodes -contains $Proc.ExitCode) {
-        Write-Log 'OK' "$Name exit $($Proc.ExitCode)"
-    } else {
-        Write-Log 'ERROR' "$Name falhou (exit $($Proc.ExitCode))"
+    # --- Tee into the live-progress window (only if the UI exists) ---
+    # Single choke point: every phase streams here for free. Headless ($script:UI = $null)
+    # makes this a no-op, so -Unattended behaves exactly like before (file + host only).
+    if ($script:UI) {
+        try {
+            $rtb = $script:UI.Log
+            $clr = $script:LevelClr[$Level]; if (-not $clr) { $clr = $script:LevelClr.INFO }
+            $rtb.SelectionStart  = $rtb.TextLength
+            $rtb.SelectionLength  = 0
+            $rtb.SelectionColor  = $clr
+            $rtb.AppendText($line + "`n")
+            $rtb.SelectionColor  = $rtb.ForeColor             # reset so the next line is default
+            $rtb.ScrollToCaret()                              # read-only RTB never focuses: needed to autoscroll
+            if ($rtb.Lines.Count -gt 5000) {                  # cap growth on long runs
+                $rtb.ReadOnly = $false
+                $rtb.Select(0, $rtb.GetFirstCharIndexFromLine(1000))
+                $rtb.SelectedText = ''
+                $rtb.ReadOnly = $true
+                $rtb.SelectionStart = $rtb.TextLength
+            }
+            [System.Windows.Forms.Application]::DoEvents()    # repaint + process window messages
+        } catch { }   # the tee must never break logging (runs inside catch/trap blocks)
     }
 }
 
-# Trap global = rede final para erro terminante NAO tratado por try/catch.
-# Aborta com exit 1 (em vez de 'continue') para nao seguir sobre estado inconsistente
-# e para sinalizar falha ao chamador (run.bat checa %errorlevel%).
+# Evaluates an installer exit code and logs OK/ERROR (instead of assuming OK).
+# 3010 (reboot required) counts as success for MSI.
+function Write-ProcResult {
+    param([string]$Name, $Proc, [int[]]$OkCodes = @(0))
+    if ($null -eq $Proc) { Write-Log 'ERROR' "${Name}: process did not start"; return }
+    if ($OkCodes -contains $Proc.ExitCode) {
+        Write-Log 'OK' "$Name exit $($Proc.ExitCode)"
+    } else {
+        Write-Log 'ERROR' "$Name failed (exit $($Proc.ExitCode))"
+    }
+}
+
+# Global trap = last-resort net for a terminating error NOT handled by try/catch.
+# Aborts with exit 1 (instead of 'continue') so we don't proceed over inconsistent state
+# and so the caller (run.bat checks %errorlevel%) is told it failed.
 trap {
-    $msg = "Erro fatal nao tratado na linha $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+    $msg = "Unhandled fatal error at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
     Write-Log 'FATAL' $msg
+    # If the window is up, let the technician read the fatal line before we exit.
+    if ($script:UI) { try { Complete-ProgressUI; Wait-WindowClosed } catch { } }
     exit 1
 }
 
-# ============================================================
-# FASE 1 — Carregar config.ps1 do pendrive
-# ============================================================
+# UI state is initialized BEFORE Add-Type so Write-Log's tee guard (and the trap) are safe
+# even if Add-Type itself throws: its catch calls Write-Log, whose `if ($script:UI)` would
+# otherwise read an unset variable and blow up under StrictMode. $script:LevelClr needs
+# System.Drawing, so it is defined right AFTER the assemblies load (just below).
+$script:UI      = $null     # control handles; $null = headless (no window)
+$script:Started = $false    # flipped by the Start button click handler
 
+# GUI assemblies are loaded up front so the live-progress window (and the color table
+# below) can be built anywhere. Failure here is fatal: nothing downstream works without them.
 try {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 } catch {
-    Write-Log 'FATAL' "Falha ao carregar assemblies GUI: $($_.Exception.Message)"
+    Write-Log 'FATAL' "Failed to load GUI assemblies: $($_.Exception.Message)"
     exit 1
 }
+
+# ============================================================
+# Live-progress UI - single window: input form on top, streaming log at the bottom
+# ============================================================
+# Approach: single-threaded, modeless Form + RichTextBox fed by Write-Log, with
+# Application.DoEvents() acting as a hand-rolled message pump (no Application.Run, no
+# runspaces). The technician fills the form on top; the section below streams every task
+# live. $script:UI = $null means headless (no window) and every UI touch becomes a no-op.
+# ($script:UI / $script:Started are initialized above, before Add-Type.)
+
+# Color per log level (uses System.Drawing, loaded just above).
+$script:LevelClr = @{
+    OK    = [System.Drawing.Color]::FromArgb(80, 220, 100)
+    WARN  = [System.Drawing.Color]::FromArgb(235, 200, 60)
+    ERROR = [System.Drawing.Color]::FromArgb(240, 90, 90)
+    FATAL = [System.Drawing.Color]::FromArgb(255, 70, 70)
+    INFO  = [System.Drawing.Color]::FromArgb(185, 185, 185)
+}
+
+# Status caption + pump (cosmetic; safe when headless).
+function Set-Phase([string]$text) {
+    if ($script:UI) {
+        $script:UI.Status.Text = $text
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+# Polls a process to completion while pumping the window (replaces blocking WaitForExit /
+# Start-Process -Wait, which would freeze a modeless window). Thread.Sleep (NOT Start-Sleep:
+# Start-Sleep inside a DoEvents loop breaks Alt-Tab / taskbar reactivation - PowerShell#19796).
+function Wait-ProcPumping($Proc) {
+    while (-not $Proc.HasExited) {
+        if ($script:UI) { [System.Windows.Forms.Application]::DoEvents() }
+        [System.Threading.Thread]::Sleep(200)
+    }
+}
+
+# End state: stop the marquee, enable Close, then pump until the technician closes the window.
+function Complete-ProgressUI {
+    if (-not $script:UI) { return }
+    $script:UI.Bar.Style    = 'Continuous'
+    $script:UI.Bar.Value    = $script:UI.Bar.Maximum
+    $script:UI.Close.Enabled = $true
+    $script:UI.Status.Text  = 'Done - you may close this window.'
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Wait-WindowClosed {
+    if (-not $script:UI) { return }
+    while ($script:UI -and -not $script:UI.Form.IsDisposed) {
+        [System.Windows.Forms.Application]::DoEvents()
+        [System.Threading.Thread]::Sleep(100)
+    }
+}
+
+# Builds the single window (form on top + live log at the bottom), wires the dynamic
+# combo events and the Start button, shows it modeless and pumps once. Reads $Printers,
+# $EmailDomains and $PathSignatures from the enclosing script scope (set before this runs).
+function Show-MainWindow {
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text            = 'New Machine Setup'
+    $f.Size            = New-Object System.Drawing.Size(580, 880)
+    $f.StartPosition   = 'CenterScreen'
+    $f.FormBorderStyle = 'Sizable'
+    $f.MinimizeBox     = $true
+    $f.MaximizeBox     = $true
+
+    # --- bottom: live log panel (added first so Dock=Fill yields the right remaining space) ---
+    $logPanel = New-Object System.Windows.Forms.Panel
+    $logPanel.Dock   = 'Bottom'
+    $logPanel.Height = 300
+
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock      = 'Top'
+    $status.Height    = 24
+    $status.TextAlign = 'MiddleLeft'
+    $status.Padding   = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+    $status.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $status.Text      = 'Fill in the form and click Start.'
+
+    $bar = New-Object System.Windows.Forms.ProgressBar
+    $bar.Dock                  = 'Top'
+    $bar.Height                = 16
+    $bar.Style                 = 'Marquee'
+    $bar.MarqueeAnimationSpeed = 30
+
+    $rtb = New-Object System.Windows.Forms.RichTextBox
+    $rtb.Dock       = 'Fill'
+    $rtb.ReadOnly   = $true
+    $rtb.BackColor  = [System.Drawing.Color]::FromArgb(20, 20, 24)
+    $rtb.ForeColor  = [System.Drawing.Color]::FromArgb(200, 200, 200)
+    $rtb.Font       = New-Object System.Drawing.Font('Consolas', 9)
+    $rtb.WordWrap   = $false
+    $rtb.ScrollBars = 'Both'
+    $rtb.DetectUrls = $false
+
+    $logPanel.Controls.Add($rtb)
+    $logPanel.Controls.Add($bar)
+    $logPanel.Controls.Add($status)
+
+    # --- top: input form (scrolls if the screen is small) ---
+    $inputPanel = New-Object System.Windows.Forms.Panel
+    $inputPanel.Dock      = 'Fill'
+    $inputPanel.AutoScroll = $true
+
+    function Add-Label([System.Windows.Forms.Control]$c, [string]$text, [int]$x, [int]$y) {
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text     = $text
+        $l.Location = New-Object System.Drawing.Point($x, $y)
+        $l.AutoSize = $true
+        $c.Controls.Add($l)
+    }
+    function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
+        $t = New-Object System.Windows.Forms.TextBox
+        $t.Location = New-Object System.Drawing.Point($x, $y)
+        $t.Size     = New-Object System.Drawing.Size($w, 23)
+        return $t
+    }
+    function New-Combo([int]$x, [int]$y, [int]$w = 480) {
+        $cb = New-Object System.Windows.Forms.ComboBox
+        $cb.Location      = New-Object System.Drawing.Point($x, $y)
+        $cb.Size          = New-Object System.Drawing.Size($w, 23)
+        $cb.DropDownStyle = 'DropDownList'
+        return $cb
+    }
+
+    $y = 12
+
+    Add-Label $inputPanel 'Full name (from the ticket):' 10 $y; $y += 20
+    $TxtFullName = New-TextBox 10 $y; $inputPanel.Controls.Add($TxtFullName); $y += 35
+
+    Add-Label $inputPanel 'Username (e.g. joao.silva):' 10 $y; $y += 20
+    $TxtUsername = New-TextBox 10 $y; $inputPanel.Controls.Add($TxtUsername); $y += 35
+
+    Add-Label $inputPanel 'Email domain:' 10 $y; $y += 20
+    $CmbDomain = New-Combo 10 $y 300
+    $EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
+    $CmbDomain.SelectedIndex = 0
+    $inputPanel.Controls.Add($CmbDomain); $y += 35
+
+    Add-Label $inputPanel 'Network configuration:' 10 $y; $y += 20
+    $RadioDhcp            = New-Object System.Windows.Forms.RadioButton
+    $RadioDhcp.Text       = 'DHCP (automatic)'
+    $RadioDhcp.Location   = New-Object System.Drawing.Point(10, $y)
+    $RadioDhcp.AutoSize   = $true
+    $RadioDhcp.Checked    = $true
+    $RadioStatic          = New-Object System.Windows.Forms.RadioButton
+    $RadioStatic.Text     = 'Static IP'
+    $RadioStatic.Location = New-Object System.Drawing.Point(190, $y)
+    $RadioStatic.AutoSize = $true
+    $inputPanel.Controls.Add($RadioDhcp); $inputPanel.Controls.Add($RadioStatic); $y += 30
+
+    $LblIp          = New-Object System.Windows.Forms.Label
+    $LblIp.Text     = 'IP (e.g. 10.0.X.X):'
+    $LblIp.Location = New-Object System.Drawing.Point(10, $y)
+    $LblIp.AutoSize = $true
+    $LblIp.Visible  = $false
+    $TxtIp          = New-TextBox 140 $y 160
+    $TxtIp.Visible  = $false
+    $inputPanel.Controls.Add($LblIp); $inputPanel.Controls.Add($TxtIp); $y += 35
+
+    $RadioStatic.Add_CheckedChanged({ $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
+    $RadioDhcp.Add_CheckedChanged({   $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
+
+    Add-Label $inputPanel 'Main printer:' 10 $y; $y += 20
+    $CmbPrinter = New-Combo 10 $y
+    $CmbPrinter.Items.Add('(None)') | Out-Null
+    foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
+    $CmbPrinter.SelectedIndex = 0
+    $inputPanel.Controls.Add($CmbPrinter); $y += 35
+
+    Add-Label $inputPanel 'Sector (for the signature):' 10 $y; $y += 20
+    $CmbSector = New-Combo 10 $y
+    $inputPanel.Controls.Add($CmbSector); $y += 35
+
+    Add-Label $inputPanel 'Base signature (.htm):' 10 $y; $y += 20
+    $CmbSigTemplate = New-Combo 10 $y
+    $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+    $CmbSigTemplate.SelectedIndex = 0
+    $inputPanel.Controls.Add($CmbSigTemplate); $y += 35
+
+    $ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
+    $ChkWebAgent.Text     = 'Install WebAgent'
+    $ChkWebAgent.Location = New-Object System.Drawing.Point(10, $y)
+    $ChkWebAgent.AutoSize = $true
+    $inputPanel.Controls.Add($ChkWebAgent); $y += 40
+
+    $BtnStart          = New-Object System.Windows.Forms.Button
+    $BtnStart.Text     = 'Start setup'
+    $BtnStart.Location = New-Object System.Drawing.Point(10, $y)
+    $BtnStart.Size     = New-Object System.Drawing.Size(480, 35)
+    $inputPanel.Controls.Add($BtnStart)
+
+    # Event: domain changes -> reload sectors
+    $CmbDomain.Add_SelectedIndexChanged({
+        if ($CmbDomain.SelectedIndex -lt 0) { return }
+        $d  = $CmbDomain.SelectedItem.ToString()
+        $dp = Join-Path $PathSignatures $d
+        $CmbSector.Items.Clear()
+        if (Test-Path $dp) {
+            $dirs = @(Get-ChildItem -Path $dp -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+            if ($dirs.Count -gt 0) { $dirs | ForEach-Object { $CmbSector.Items.Add($_) | Out-Null } }
+            else { $CmbSector.Items.Add('(No sectors)') | Out-Null }
+        } else {
+            $CmbSector.Items.Add('(Folder not found)') | Out-Null
+        }
+        if ($CmbSector.Items.Count -gt 0) { $CmbSector.SelectedIndex = 0 }
+    })
+
+    # Event: sector changes -> reload available .htm files
+    $CmbSector.Add_SelectedIndexChanged({
+        if ($CmbSector.SelectedIndex -lt 0 -or -not $CmbDomain.SelectedItem) { return }
+        $d = $CmbDomain.SelectedItem.ToString()
+        $s = $CmbSector.SelectedItem.ToString()
+        $CmbSigTemplate.Items.Clear()
+        $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+        if ($s -notmatch '^\(') {
+            $sp = Join-Path (Join-Path $PathSignatures $d) $s
+            if (Test-Path $sp) {
+                Get-ChildItem -Path $sp -Filter '*.htm' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notmatch '^[._]' } |
+                    ForEach-Object { $CmbSigTemplate.Items.Add($_.Name) | Out-Null }
+            }
+        }
+        $CmbSigTemplate.SelectedIndex = 0
+    })
+
+    # Start: validate, copy values to script scope, lock inputs, flip $Started.
+    # The work runs in the main flow (NOT in this handler) so no interactive control is
+    # enabled during the run -> no DoEvents re-entrancy. The window is NOT closed.
+    $BtnStart.Add_Click({
+        if (-not $TxtFullName.Text.Trim()) {
+            [System.Windows.Forms.MessageBox]::Show('Fill in the full name.', 'Setup', 'OK', 'Warning') | Out-Null; return
+        }
+        if (-not $TxtUsername.Text.Trim()) {
+            [System.Windows.Forms.MessageBox]::Show('Fill in the username.', 'Setup', 'OK', 'Warning') | Out-Null; return
+        }
+        if ($RadioStatic.Checked -and -not $TxtIp.Text.Trim()) {
+            [System.Windows.Forms.MessageBox]::Show('Fill in the static IP.', 'Setup', 'OK', 'Warning') | Out-Null; return
+        }
+
+        $script:FullName    = $TxtFullName.Text.Trim()
+        $script:Username    = $TxtUsername.Text.Trim().ToLower()
+        $script:EmailDomain = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { $EmailDomains[0] }
+        $script:Email       = "$($script:Username)@$($script:EmailDomain)"
+        $script:UseStatic   = $RadioStatic.Checked
+        $script:StaticIp    = if ($RadioStatic.Checked) { $TxtIp.Text.Trim() } else { '' }
+        $pidx               = $CmbPrinter.SelectedIndex
+        $script:SelectedPrinter = if ($pidx -gt 0) { $Printers[$pidx - 1] } else { $null }
+        $script:SectorName  = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
+        $script:SigTemplate = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
+        $script:InstallWebAgent = $ChkWebAgent.Checked
+
+        $BtnStart.Enabled = $false
+        foreach ($ctl in $script:UI.Inputs) { $ctl.Enabled = $false }
+        $script:UI.Status.Text = 'Running setup...'
+        $script:Started = $true
+    })
+
+    # Initial load: fire the domain event to populate sectors and templates
+    $CmbDomain.SelectedIndex = -1
+    $CmbDomain.SelectedIndex = 0
+
+    # Closing the window mid-run just drops the UI reference; the run keeps going (log
+    # falls back to file + host). We never abort a half-provisioned machine on a window close.
+    $f.Add_FormClosed({ $script:UI = $null })
+
+    $f.Controls.Add($inputPanel)
+    $f.Controls.Add($logPanel)
+
+    $script:UI = @{
+        Form   = $f
+        Log    = $rtb
+        Bar    = $bar
+        Status = $status
+        Close  = $BtnStart   # placeholder; replaced just below by a dedicated Close button
+        Inputs = @($TxtFullName, $TxtUsername, $CmbDomain, $RadioDhcp, $RadioStatic, $TxtIp,
+                   $CmbPrinter, $CmbSector, $CmbSigTemplate, $ChkWebAgent)
+    }
+
+    # Dedicated Close button at the bottom of the log panel (disabled until the run finishes).
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Dock    = 'Bottom'
+    $btnClose.Height  = 34
+    $btnClose.Text    = 'Close'
+    $btnClose.Enabled = $false
+    $btnClose.Add_Click({ if ($script:UI) { $script:UI.Form.Close() } })
+    $logPanel.Controls.Add($btnClose)
+    $script:UI.Close = $btnClose
+
+    $f.Show()                                          # modeless: returns immediately
+    [System.Windows.Forms.Application]::DoEvents()      # force the first paint
+}
+
+# ============================================================
+# PHASE 1 - Load config.ps1 from the USB
+# ============================================================
 
 $ConfigFile = Join-Path $ScriptDir 'config.ps1'
 if (-not (Test-Path $ConfigFile)) {
     [System.Windows.Forms.MessageBox]::Show(
-        "config.ps1 nao encontrado em: $ScriptDir`nColoque config.ps1 na raiz do pendrive e execute novamente.",
-        'Setup — Erro', 'OK', 'Error') | Out-Null
+        "config.ps1 not found at: $ScriptDir`nPut config.ps1 at the USB root and run again.",
+        'Setup - Error', 'OK', 'Error') | Out-Null
     exit 1
 }
 try {
     . $ConfigFile
-    Write-Log 'OK' "config.ps1 carregado de: $ConfigFile"
+    Write-Log 'OK' "config.ps1 loaded from: $ConfigFile"
 } catch {
-    Write-Log 'FATAL' "Falha ao executar config.ps1: $($_.Exception.Message)"
+    Write-Log 'FATAL' "Failed to execute config.ps1: $($_.Exception.Message)"
     [System.Windows.Forms.MessageBox]::Show(
-        "Erro ao carregar config.ps1:`n$($_.Exception.Message)",
-        'Setup — Erro Fatal', 'OK', 'Error') | Out-Null
+        "Error loading config.ps1:`n$($_.Exception.Message)",
+        'Setup - Fatal Error', 'OK', 'Error') | Out-Null
     exit 1
 }
 
-# Valida variaveis obrigatorias do config ANTES de usar (sob StrictMode, indexar uma
-# variavel ausente vira FATAL generico — aqui da uma mensagem acionavel e aborta cedo).
+# Validate the required config variables BEFORE using them (under StrictMode, indexing a
+# missing variable becomes a generic FATAL - here we give an actionable message and abort early).
 $RequiredConfig = @('AdminAccount', 'AdminNewPass', 'UserInitialPass', 'EmailDomains', 'PathSignatures')
 $missing = $RequiredConfig | Where-Object {
     $v = Get-Variable $_ -ErrorAction SilentlyContinue
     (-not $v) -or ($null -eq $v.Value) -or (($v.Value -is [string]) -and ($v.Value.Trim() -eq ''))
 }
 if ($missing) {
-    $msg = "config.ps1 nao define: " + ($missing -join ', ')
+    $msg = "config.ps1 does not define: " + ($missing -join ', ')
     Write-Log 'FATAL' $msg
-    [System.Windows.Forms.MessageBox]::Show($msg, 'Setup — config.ps1 incompleto', 'OK', 'Error') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show($msg, 'Setup - incomplete config.ps1', 'OK', 'Error') | Out-Null
     exit 1
 }
 
-# Config OPCIONAL: se config.ps1 omitir, criar com $null para nao estourar StrictMode
-# mais a frente (ex.: `if ($WifiSSID)` indexa a variavel ausente e e' FATAL sob StrictMode).
-# Todas sao usadas sob guarda (`if ($Var)`) ou validadas no ponto de uso.
+# OPTIONAL config: if config.ps1 omits it, create it as $null so StrictMode does not blow up
+# later (e.g. `if ($WifiSSID)` indexes the missing variable and is FATAL under StrictMode).
+# All of these are used under a guard (`if ($Var)`) or validated at the point of use.
 $OptionalConfig = @('WifiSSID', 'WifiPass', 'SharePath', 'ShareUser', 'SharePass',
                     'WallpaperFile', 'StaticPrefixLength', 'StaticGateway', 'DnsServers')
 foreach ($o in $OptionalConfig) {
@@ -109,41 +437,41 @@ foreach ($o in $OptionalConfig) {
     }
 }
 
-# Ativar Windows com chave OEM do firmware UEFI (Dell OA3)
+# Activate Windows with the OEM key from the UEFI firmware (Dell OA3)
 try {
     $oemKey = (Get-CimInstance SoftwareLicensingService -ErrorAction Stop).OA3xOriginalProductKey
     if ($oemKey -and $oemKey.Trim().Length -gt 0) {
         cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ipk $oemKey 2>&1 | Out-Null
-        # /ipk via cscript e' sincrono (cscript espera o script); o /ato pode seguir direto.
+        # /ipk via cscript is synchronous (cscript waits for the script); /ato can follow directly.
         cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato 2>&1 | Out-Null
-        Write-Log 'OK' "Chave OEM do firmware aplicada e ativacao solicitada"
+        Write-Log 'OK' "OEM firmware key applied and activation requested"
     } else {
-        Write-Log 'WARN' "Chave OEM nao encontrada no firmware UEFI"
+        Write-Log 'WARN' "No OEM key found in the UEFI firmware"
     }
 } catch {
-    Write-Log 'ERROR' "Ativacao OEM: $($_.Exception.Message)"
+    Write-Log 'ERROR' "OEM activation: $($_.Exception.Message)"
 }
 
-# Trocar senha de bootstrap da conta admin ($AdminAccount, criada pelo autounattend)
-# pela senha real do config.ps1
+# Rotate the admin account bootstrap password ($AdminAccount, created by autounattend)
+# to the real password from config.ps1
 try {
     $adminPass = ConvertTo-SecureString $AdminNewPass -AsPlainText -Force
     Set-LocalUser -Name $AdminAccount -Password $adminPass -ErrorAction Stop
-    Write-Log 'OK' "Senha de $AdminAccount atualizada (bootstrap removida)"
+    Write-Log 'OK' "$AdminAccount password updated (bootstrap removed)"
 } catch {
-    Write-Log 'ERROR' "Trocar senha de ${AdminAccount}: $($_.Exception.Message)"
-    # Falha aqui deixa a maquina com a senha BOOTSTRAP (a do autounattend). Tratar como
-    # grave: alerta bloqueante no modo interativo + o erro ja entra no resumo final (exit 1).
+    Write-Log 'ERROR' "Rotate ${AdminAccount} password: $($_.Exception.Message)"
+    # Failing here leaves the machine on the BOOTSTRAP password (the autounattend one). Treat it
+    # as serious: a blocking alert in interactive mode + the error is already in the final summary (exit 1).
     if (-not $Unattended) {
         [System.Windows.Forms.MessageBox]::Show(
-            "FALHA AO TROCAR A SENHA DE $AdminAccount.`n`nA maquina esta com a senha BOOTSTRAP. " +
-            "Troque manualmente ANTES de entregar (ex.: net user $AdminAccount *).`n`nErro: $($_.Exception.Message)",
-            'Setup — RISCO DE SEGURANCA', 'OK', 'Error') | Out-Null
+            "FAILED TO ROTATE THE $AdminAccount PASSWORD.`n`nThe machine is on the BOOTSTRAP password. " +
+            "Change it manually BEFORE handing it over (e.g. net user $AdminAccount *).`n`nError: $($_.Exception.Message)",
+            'Setup - SECURITY RISK', 'OK', 'Error') | Out-Null
     }
 }
 
 # ============================================================
-# FASE 2 — WiFi, share e dados iniciais
+# PHASE 2 - WiFi, share and initial data
 # ============================================================
 
 # WiFi
@@ -174,44 +502,44 @@ if ($WifiSSID) { try {
     $wifiXmlPath = "$env:TEMP\corp_wifi_profile.xml"
     Set-Content -Path $wifiXmlPath -Value $wifiXml -Encoding UTF8
     netsh wlan add profile filename="$wifiXmlPath" 2>&1 | Out-Null
-    # add profile grava o perfil de forma sincrona; o connect pode ser emitido direto.
+    # add profile writes the profile synchronously; connect can be issued directly.
     netsh wlan connect name="$WifiSSID" 2>&1 | Out-Null
-    Write-Log 'OK' "WiFi $WifiSSID configurado"
+    Write-Log 'OK' "WiFi $WifiSSID configured"
 } catch {
     Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
-} } else { Write-Log 'WARN' "WiFi ignorado (WifiSSID vazio)" }
+} } else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
 
-# Mapear share
+# Map the share
 if ($SharePath) { try {
     New-SmbMapping -RemotePath $SharePath -UserName $ShareUser -Password $SharePass -Persistent $false -ErrorAction Stop | Out-Null
-    Write-Log 'OK' "Share mapeado: $SharePath"
+    Write-Log 'OK' "Share mapped: $SharePath"
 } catch {
     Write-Log 'WARN' "Share: $($_.Exception.Message)"
-} } else { Write-Log 'WARN' "Share ignorado (SharePath vazio)" }
+} } else { Write-Log 'WARN' "Share skipped (SharePath empty)" }
 
-# Carregar printers.json do pendrive
+# Load printers.json from the USB
 $Printers = @()
 $PrintersJson = Join-Path $ScriptDir 'printers.json'
 if (Test-Path $PrintersJson) {
     try {
         $Printers = @(Get-Content $PrintersJson -Raw -Encoding UTF8 | ConvertFrom-Json)
-        Write-Log 'OK' "$($Printers.Count) impressoras carregadas"
+        Write-Log 'OK' "$($Printers.Count) printers loaded"
     } catch {
         Write-Log 'ERROR' "printers.json: $($_.Exception.Message)"
     }
 } else {
-    Write-Log 'WARN' "printers.json nao encontrado no pendrive"
+    Write-Log 'WARN' "printers.json not found on the USB"
 }
 
 # ============================================================
-# Pre-GUI — dispara o Ninite cedo (overlap com a digitacao da GUI)
+# Pre-GUI - kick off Ninite early (overlaps with the technician filling the form)
 # ============================================================
-# Ninite e' o instalador mais longo (baixa varios apps da internet). Lancado AQUI,
-# baixa enquanto o tecnico preenche a GUI (tempo morto). A internet vem do WiFi
-# (FASE 2, DHCP, ja no ar); independe do ethernet, que so e' configurado na FASE 4.
-# A infra do pool (Start-BgInstall/$BgInstalls) e' definida aqui e reusada na FASE 5;
-# o join de todos e' na FASE 7. Mutex MSI: Ninite e WebAgent nao se sobrepoem
-# (WebAgent so roda na FASE 7, apos o pool).
+# Ninite is the longest installer (downloads several apps from the internet). Launched HERE,
+# it downloads while the technician fills the form (dead time). Internet comes from the WiFi
+# (PHASE 2, DHCP, already up); it does not depend on Ethernet, which is configured in PHASE 4.
+# The pool infra (Start-BgInstall/$BgInstalls) is defined here and reused in PHASE 5; the join
+# of all of them is in PHASE 7. MSI mutex: Ninite and WebAgent never overlap (WebAgent only runs
+# in PHASE 7, after the pool).
 $BgInstalls = [System.Collections.Generic.List[object]]::new()
 function Start-BgInstall {
     param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0))
@@ -219,7 +547,7 @@ function Start-BgInstall {
     if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
     $proc = Start-Process @params
     $BgInstalls.Add([pscustomobject]@{ Name = $Name; Proc = $proc; OkCodes = $OkCodes })
-    Write-Log 'INFO' "$Name iniciado em background (PID $($proc.Id))"
+    Write-Log 'INFO' "$Name started in the background (PID $($proc.Id))"
     return $proc
 }
 
@@ -228,196 +556,46 @@ if (Test-Path $NinitePath) {
     try { Start-BgInstall 'Ninite' $NinitePath | Out-Null }
     catch { Write-Log 'ERROR' "Ninite: $($_.Exception.Message)" }
 } else {
-    Write-Log 'WARN' "ninite.exe nao encontrado no pendrive"
+    Write-Log 'WARN' "ninite.exe not found on the USB"
 }
 
 # ============================================================
-# FASE 3 — GUI
+# PHASE 3 - Collect inputs (single live window) or resolve from -Test* params
 # ============================================================
+# Interactive: show the single window (form + live log) and wait, via a hand-rolled DoEvents
+# pump, until the technician clicks Start. Headless ($Unattended, or no interactive desktop):
+# values come from the -Test* params and no window is shown.
 
-if (-not $Unattended) {
-try {
+$useUI = (-not $Unattended) -and [System.Environment]::UserInteractive
 
-$Form = New-Object System.Windows.Forms.Form
-$Form.Text            = 'Configuracao de Maquina Nova'
-$Form.Size            = New-Object System.Drawing.Size(520, 660)
-$Form.StartPosition   = 'CenterScreen'
-$Form.FormBorderStyle = 'FixedDialog'
-$Form.MaximizeBox     = $false
-
-function Add-Label([System.Windows.Forms.Form]$f, [string]$text, [int]$x, [int]$y) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text     = $text
-    $l.Location = New-Object System.Drawing.Point($x, $y)
-    $l.AutoSize = $true
-    $f.Controls.Add($l)
-}
-
-function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
-    $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = New-Object System.Drawing.Point($x, $y)
-    $t.Size     = New-Object System.Drawing.Size($w, 23)
-    return $t
-}
-
-function New-Combo([int]$x, [int]$y, [int]$w = 480) {
-    $c = New-Object System.Windows.Forms.ComboBox
-    $c.Location      = New-Object System.Drawing.Point($x, $y)
-    $c.Size          = New-Object System.Drawing.Size($w, 23)
-    $c.DropDownStyle = 'DropDownList'
-    return $c
-}
-
-$y = 12
-
-Add-Label $Form 'Nome completo (do chamado):' 10 $y; $y += 20
-$TxtFullName = New-TextBox 10 $y; $Form.Controls.Add($TxtFullName); $y += 35
-
-Add-Label $Form 'Username (ex: joao.silva):' 10 $y; $y += 20
-$TxtUsername = New-TextBox 10 $y; $Form.Controls.Add($TxtUsername); $y += 35
-
-Add-Label $Form 'Dominio de email:' 10 $y; $y += 20
-$CmbDomain = New-Combo 10 $y 300
-$EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
-$CmbDomain.SelectedIndex = 0
-$Form.Controls.Add($CmbDomain); $y += 35
-
-Add-Label $Form 'Configuracao de rede:' 10 $y; $y += 20
-$RadioDhcp            = New-Object System.Windows.Forms.RadioButton
-$RadioDhcp.Text       = 'DHCP (automatico)'
-$RadioDhcp.Location   = New-Object System.Drawing.Point(10, $y)
-$RadioDhcp.AutoSize   = $true
-$RadioDhcp.Checked    = $true
-$RadioStatic          = New-Object System.Windows.Forms.RadioButton
-$RadioStatic.Text     = 'IP Estatico'
-$RadioStatic.Location = New-Object System.Drawing.Point(190, $y)
-$RadioStatic.AutoSize = $true
-$Form.Controls.Add($RadioDhcp); $Form.Controls.Add($RadioStatic); $y += 30
-
-$LblIp      = New-Object System.Windows.Forms.Label
-$LblIp.Text = 'IP (ex: 10.0.X.X):'
-$LblIp.Location = New-Object System.Drawing.Point(10, $y)
-$LblIp.AutoSize = $true
-$LblIp.Visible  = $false
-$TxtIp          = New-TextBox 140 $y 160
-$TxtIp.Visible  = $false
-$Form.Controls.Add($LblIp); $Form.Controls.Add($TxtIp); $y += 35
-
-$RadioStatic.Add_CheckedChanged({ $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
-$RadioDhcp.Add_CheckedChanged({   $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
-
-Add-Label $Form 'Impressora principal:' 10 $y; $y += 20
-$CmbPrinter = New-Combo 10 $y
-$CmbPrinter.Items.Add('(Nenhuma)') | Out-Null
-foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) — $($p.model) [$($p.ip)]") | Out-Null }
-$CmbPrinter.SelectedIndex = 0
-$Form.Controls.Add($CmbPrinter); $y += 35
-
-Add-Label $Form 'Setor (para assinatura):' 10 $y; $y += 20
-$CmbSector = New-Combo 10 $y
-$Form.Controls.Add($CmbSector); $y += 35
-
-Add-Label $Form 'Assinatura base (.htm):' 10 $y; $y += 20
-$CmbSigTemplate = New-Combo 10 $y
-$CmbSigTemplate.Items.Add('(Automatico — primeiro encontrado)') | Out-Null
-$CmbSigTemplate.SelectedIndex = 0
-$Form.Controls.Add($CmbSigTemplate); $y += 35
-
-$ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
-$ChkWebAgent.Text     = 'Instalar WebAgent'
-$ChkWebAgent.Location = New-Object System.Drawing.Point(10, $y)
-$ChkWebAgent.AutoSize = $true
-$Form.Controls.Add($ChkWebAgent); $y += 40
-
-$BtnOk          = New-Object System.Windows.Forms.Button
-$BtnOk.Text     = 'Iniciar Configuracao'
-$BtnOk.Location = New-Object System.Drawing.Point(10, $y)
-$BtnOk.Size     = New-Object System.Drawing.Size(480, 35)
-$BtnOk.Add_Click({
-    if (-not $TxtFullName.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Preencha o nome completo.', 'Setup', 'OK', 'Warning') | Out-Null; return
-    }
-    if (-not $TxtUsername.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Preencha o username.', 'Setup', 'OK', 'Warning') | Out-Null; return
-    }
-    if ($RadioStatic.Checked -and -not $TxtIp.Text.Trim()) {
-        [System.Windows.Forms.MessageBox]::Show('Preencha o IP estatico.', 'Setup', 'OK', 'Warning') | Out-Null; return
-    }
-    $Form.Tag = 'OK'
-    $Form.Close()
-})
-$Form.Controls.Add($BtnOk)
-
-# Evento: dominio muda → recarrega setores
-$CmbDomain.Add_SelectedIndexChanged({
-    if ($CmbDomain.SelectedIndex -lt 0) { return }
-    $d  = $CmbDomain.SelectedItem.ToString()
-    $dp = Join-Path $PathSignatures $d
-    $CmbSector.Items.Clear()
-    if (Test-Path $dp) {
-        $dirs = @(Get-ChildItem -Path $dp -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-        if ($dirs.Count -gt 0) { $dirs | ForEach-Object { $CmbSector.Items.Add($_) | Out-Null } }
-        else { $CmbSector.Items.Add('(Sem setores)') | Out-Null }
-    } else {
-        $CmbSector.Items.Add('(Pasta nao encontrada)') | Out-Null
-    }
-    if ($CmbSector.Items.Count -gt 0) { $CmbSector.SelectedIndex = 0 }
-})
-
-# Evento: setor muda → recarrega .htm disponiveis
-$CmbSector.Add_SelectedIndexChanged({
-    if ($CmbSector.SelectedIndex -lt 0 -or -not $CmbDomain.SelectedItem) { return }
-    $d = $CmbDomain.SelectedItem.ToString()
-    $s = $CmbSector.SelectedItem.ToString()
-    $CmbSigTemplate.Items.Clear()
-    $CmbSigTemplate.Items.Add('(Automatico — primeiro encontrado)') | Out-Null
-    if ($s -notmatch '^\(') {
-        $sp = Join-Path (Join-Path $PathSignatures $d) $s
-        if (Test-Path $sp) {
-            Get-ChildItem -Path $sp -Filter '*.htm' -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch '^[._]' } |
-                ForEach-Object { $CmbSigTemplate.Items.Add($_.Name) | Out-Null }
+if ($useUI) {
+    try {
+        Show-MainWindow
+        while (-not $script:Started -and $script:UI -and -not $script:UI.Form.IsDisposed) {
+            [System.Windows.Forms.Application]::DoEvents()
+            [System.Threading.Thread]::Sleep(50)
         }
+    } catch {
+        Write-Log 'FATAL' "GUI failed: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Fatal GUI error:`n$($_.Exception.Message)",
+            'Setup - Fatal Error', 'OK', 'Error') | Out-Null
+        exit 1
     }
-    $CmbSigTemplate.SelectedIndex = 0
-})
-
-# Carga inicial: dispara evento de dominio para popular setores e templates
-$CmbDomain.SelectedIndex = -1
-$CmbDomain.SelectedIndex = 0
-
-$Form.ShowDialog() | Out-Null
-
-if ($Form.Tag -ne 'OK') {
-    Write-Log 'WARN' "Setup cancelado"
-    exit 0
-}
-
-$FullName        = $TxtFullName.Text.Trim()
-$Username        = $TxtUsername.Text.Trim().ToLower()
-$EmailDomain     = $CmbDomain.SelectedItem.ToString()
-$Email           = "$Username@$EmailDomain"
-$UseStatic       = $RadioStatic.Checked
-$StaticIp        = if ($UseStatic) { $TxtIp.Text.Trim() } else { '' }
-$PrinterIdx      = $CmbPrinter.SelectedIndex
-$SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { $null }
-$SectorName      = $CmbSector.SelectedItem.ToString()
-$SigTemplate     = $CmbSigTemplate.SelectedItem.ToString()
-$InstallWebAgent = $ChkWebAgent.Checked
-
-Write-Log 'INFO' "Nome=$FullName | User=$Username | Email=$Email"
-Write-Log 'INFO' "Rede=$(if ($UseStatic) { "Estatico $StaticIp" } else { 'DHCP' })"
-Write-Log 'INFO' "Impressora=$(if ($SelectedPrinter) { $SelectedPrinter.name } else { 'Nenhuma' })"
-Write-Log 'INFO' "Setor=$SectorName | Template=$SigTemplate | WebAgent=$InstallWebAgent"
-
-} catch {
-    Write-Log 'FATAL' "Interface grafica falhou: $($_.Exception.Message)"
-    [System.Windows.Forms.MessageBox]::Show(
-        "Erro fatal na interface grafica:`n$($_.Exception.Message)",
-        'Setup — Erro Fatal', 'OK', 'Error') | Out-Null
-    exit 1
-}
-
+    if (-not $script:Started) {
+        Write-Log 'WARN' "Setup cancelled (window closed before Start)"
+        exit 0
+    }
+    $FullName        = $script:FullName
+    $Username        = $script:Username
+    $EmailDomain     = $script:EmailDomain
+    $Email           = $script:Email
+    $UseStatic       = $script:UseStatic
+    $StaticIp        = $script:StaticIp
+    $SelectedPrinter = $script:SelectedPrinter
+    $SectorName      = $script:SectorName
+    $SigTemplate     = $script:SigTemplate
+    $InstallWebAgent = $script:InstallWebAgent
 } else {
     $EmailDomain     = if ($TestDomain) { $TestDomain } else { $EmailDomains[0] }
     $FullName        = $TestFullName
@@ -435,69 +613,70 @@ Write-Log 'INFO' "Setor=$SectorName | Template=$SigTemplate | WebAgent=$InstallW
             Select-Object -First 1 -ExpandProperty Name)
     } else { '' }
 
-    $SigTemplate     = '(Automatico — primeiro encontrado)'
+    $SigTemplate     = '(Automatic - first found)'
     $InstallWebAgent = $TestWebAgent.IsPresent
-
-    Write-Log 'INFO' "Modo nao-interativo (Unattended)"
-    Write-Log 'INFO' "Nome=$FullName | User=$Username | Email=$Email"
-    Write-Log 'INFO' "Rede=$(if ($UseStatic) { "Estatico $StaticIp" } else { 'DHCP' })"
-    Write-Log 'INFO' "Impressora=$(if ($SelectedPrinter) { $SelectedPrinter.name } else { 'Nenhuma' })"
-    Write-Log 'INFO' "Setor=$SectorName | Template=$SigTemplate | WebAgent=$InstallWebAgent"
 }
 
-# ============================================================
-# FASE 4 — Renomear PC + criar usuario + rede + wallpaper
-# ============================================================
+Write-Log 'INFO' "Mode: $(if ($useUI) { 'interactive' } else { 'unattended' })"
+Write-Log 'INFO' "Name=$FullName | User=$Username | Email=$Email"
+Write-Log 'INFO' "Network=$(if ($UseStatic) { "Static $StaticIp" } else { 'DHCP' })"
+Write-Log 'INFO' "Printer=$(if ($SelectedPrinter) { $SelectedPrinter.name } else { 'None' })"
+Write-Log 'INFO' "Sector=$SectorName | Template=$SigTemplate | WebAgent=$InstallWebAgent"
 
-# Renomear PC para serial do BIOS
+# ============================================================
+# PHASE 4 - Rename PC + create user + network + wallpaper
+# ============================================================
+Set-Phase 'Phase 4 - rename PC, create user, network, wallpaper'
+
+# Rename the PC to the BIOS serial
 try {
     $sn = (Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber
     if ($sn -and $sn.Trim().Length -gt 0 -and $sn -notmatch 'O\.E\.M\.|Default|System Serial|To Be Filled') {
         $newName = $sn.Trim() -replace '[^A-Za-z0-9-]', ''
         if ($newName.Length -gt 15) { $newName = $newName.Substring(0, 15) }
         if ($env:COMPUTERNAME -eq $newName) {
-            Write-Log 'OK' "PC ja nomeado como $newName"
+            Write-Log 'OK' "PC already named $newName"
         } else {
             Rename-Computer -NewName $newName -Force -ErrorAction Stop
-            Write-Log 'OK' "PC renomeado para: $newName (efetivo no proximo reboot)"
+            Write-Log 'OK' "PC renamed to: $newName (effective after the next reboot)"
         }
     } else {
-        Write-Log 'WARN' "Serial invalido ou generico: '$sn' — renomear manualmente"
+        Write-Log 'WARN' "Invalid or generic serial: '$sn' - rename manually"
     }
 } catch {
-    Write-Log 'ERROR' "Renomear PC: $($_.Exception.Message)"
+    Write-Log 'ERROR' "Rename PC: $($_.Exception.Message)"
 }
 
-# Usuario local
+# Local user
 try {
     $SecPass = ConvertTo-SecureString $UserInitialPass -AsPlainText -Force
     if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
-        Write-Log 'OK' "Usuario ja existe: $Username"
+        Write-Log 'OK' "User already exists: $Username"
     } else {
         New-LocalUser -Name $Username -Password $SecPass -FullName $FullName `
-                      -Description 'Criado por setup.ps1' -PasswordNeverExpires:$true -ErrorAction Stop | Out-Null
-        Write-Log 'OK' "Usuario criado: $Username"
+                      -Description 'Created by setup.ps1' -PasswordNeverExpires:$true -ErrorAction Stop | Out-Null
+        Write-Log 'OK' "User created: $Username"
     }
 
-    # Grupo 'Users' por SID (S-1-5-32-545) — independe do locale (pt-BR 'Usuarios' vs en 'Users')
+    # 'Users' group by SID (S-1-5-32-545) - independent of locale (pt-BR 'Usuarios' vs en 'Users')
     try {
         $usersGroup = (Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction Stop).Name
         $isMember = @(Get-LocalGroupMember -Group $usersGroup -ErrorAction SilentlyContinue |
                       Where-Object { $_.Name -like "*\$Username" -or $_.Name -eq $Username }).Count -gt 0
         if ($isMember) {
-            Write-Log 'OK' "Usuario $Username ja esta no grupo $usersGroup"
+            Write-Log 'OK' "User $Username already in the $usersGroup group"
         } else {
             Add-LocalGroupMember -Group $usersGroup -Member $Username -ErrorAction Stop
-            Write-Log 'OK' "Usuario $Username adicionado ao grupo $usersGroup"
+            Write-Log 'OK' "User $Username added to the $usersGroup group"
         }
     } catch {
-        Write-Log 'ERROR' "Adicionar ao grupo de usuarios: $($_.Exception.Message)"
+        Write-Log 'ERROR' "Add to the users group: $($_.Exception.Message)"
     }
 } catch {
-    Write-Log 'ERROR' "Criar usuario: $($_.Exception.Message)"
+    Write-Log 'ERROR' "Create user: $($_.Exception.Message)"
 }
 
-# Rede
+# Network
 try {
     $adapter = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Loopback' } |
                Select-Object -First 1
@@ -505,12 +684,12 @@ try {
         if ($UseStatic -and $StaticIp) {
             $missNet = @('StaticPrefixLength', 'StaticGateway', 'DnsServers') |
                        Where-Object { -not (Get-Variable $_ -ValueOnly -ErrorAction SilentlyContinue) }
-            if ($missNet) { throw "config.ps1 nao define para IP estatico: $($missNet -join ', ')" }
+            if ($missNet) { throw "config.ps1 does not define for static IP: $($missNet -join ', ')" }
             New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $StaticIp `
                              -PrefixLength $StaticPrefixLength -DefaultGateway $StaticGateway -ErrorAction Stop | Out-Null
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
                                        -ServerAddresses $DnsServers -ErrorAction Stop | Out-Null
-            Write-Log 'OK' "IP estatico: $StaticIp /$StaticPrefixLength GW $StaticGateway"
+            Write-Log 'OK' "Static IP: $StaticIp /$StaticPrefixLength GW $StaticGateway"
         } else {
             Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
                 Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
@@ -518,14 +697,14 @@ try {
             Remove-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
             Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -Dhcp Enabled -ErrorAction SilentlyContinue | Out-Null
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
-            Write-Log 'OK' "DHCP configurado"
+            Write-Log 'OK' "DHCP configured"
         }
     }
 } catch {
-    Write-Log 'ERROR' "Rede: $($_.Exception.Message)"
+    Write-Log 'ERROR' "Network: $($_.Exception.Message)"
 }
 
-# Wallpaper (so se config.ps1 definiu WallpaperFile — evita Join-Path com $null sob StrictMode)
+# Wallpaper (only if config.ps1 set WallpaperFile - avoids Join-Path with $null under StrictMode)
 $WallpaperSrc = if ($WallpaperFile) { Join-Path $ScriptDir $WallpaperFile } else { $null }
 if ($WallpaperSrc -and (Test-Path $WallpaperSrc)) {
     try {
@@ -541,21 +720,22 @@ public class CorpWallpaper {
 }
 '@
         [CorpWallpaper]::SystemParametersInfo(20, 0, "$WallpaperDest\wallpaper.jpg", 3) | Out-Null
-        Write-Log 'OK' "Wallpaper aplicado"
+        Write-Log 'OK' "Wallpaper applied"
     } catch {
         Write-Log 'ERROR' "Wallpaper: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-# FASE 5 — Instalar programas (resto do pool, em paralelo)
+# PHASE 5 - Install programs (the rest of the pool, in parallel)
 # ============================================================
-# Ninite ja foi lancado no pre-GUI (baixando durante a digitacao). Aqui entram os
-# demais via Start-BgInstall (sem -Wait): Office (Click-to-Run, engine separada),
-# Belarc e Epson (EXE /S). O join e' na FASE 7; a assinatura (FASE 6) roda sobreposta.
-# WebAgent (MSI) so na FASE 7, apos o pool (mutex _MSIExecute / erro 1618).
+# Ninite was already launched in the pre-GUI step (downloading during form entry). Here go the
+# rest via Start-BgInstall (no -Wait): Office (Click-to-Run, separate engine), Belarc and Epson
+# (EXE /S). The join is in PHASE 7; the signature (PHASE 6) runs overlapped. WebAgent (MSI) only
+# in PHASE 7, after the pool (mutex _MSIExecute / error 1618).
+Set-Phase 'Phase 5 - installing programs (parallel)'
 
-# Office (pool) — Click-to-Run e' engine separada do msiexec, roda paralelo
+# Office (pool) - Click-to-Run is a separate engine from msiexec, runs in parallel
 try {
     $officeOdt   = Join-Path $PathOffice 'setup.exe'
     $officeLocal = Join-Path $ScriptDir 'OfficeSetup.exe'
@@ -566,42 +746,43 @@ try {
     } elseif (Test-Path $officeLocal) {
         Start-BgInstall 'Office Click-to-Run' $officeLocal | Out-Null
     } else {
-        Write-Log 'WARN' "Instalador Office nao encontrado (share: $PathOffice | pendrive: $ScriptDir)"
+        Write-Log 'WARN' "Office installer not found (share: $PathOffice | USB: $ScriptDir)"
     }
 } catch { Write-Log 'ERROR' "Office: $($_.Exception.Message)" }
 
-# Belarc (pool) — EXE /S
+# Belarc (pool) - EXE /S
 try {
     $belarc = Get-ChildItem -Path $PathBelarc -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($belarc) { Start-BgInstall 'Belarc' $belarc.FullName @('/S') | Out-Null }
-    else { Write-Log 'WARN' "Instalador Belarc nao encontrado em $PathBelarc" }
+    else { Write-Log 'WARN' "Belarc installer not found in $PathBelarc" }
 } catch { Write-Log 'ERROR' "Belarc: $($_.Exception.Message)" }
 
-# Epson driver (pool) + porta TCP/IP. A impressora e' adicionada na FASE 7, depois
-# do driver registrar (o join garante que o instalador saiu). A porta nao depende do
-# driver, entao ja e' criada aqui.
+# Epson driver (pool) + TCP/IP port. The printer is added in PHASE 7, after the driver
+# registers (the join guarantees the installer exited). The port does not depend on the
+# driver, so it is created here.
 $script:PrinterPort = $null
 if ($SelectedPrinter) {
     try {
         $epson = Get-ChildItem -Path $PathEpson -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($epson) { Start-BgInstall 'Driver Epson' $epson.FullName @('/S') | Out-Null }
-        else { Write-Log 'WARN' "Instalador Epson nao encontrado em $PathEpson" }
+        if ($epson) { Start-BgInstall 'Epson driver' $epson.FullName @('/S') | Out-Null }
+        else { Write-Log 'WARN' "Epson installer not found in $PathEpson" }
         $script:PrinterPort = "IP_$($SelectedPrinter.ip)"
         Add-PrinterPort -Name $script:PrinterPort -PrinterHostAddress $SelectedPrinter.ip -ErrorAction SilentlyContinue
-    } catch { Write-Log 'ERROR' "Impressora (preparo): $($_.Exception.Message)" }
+    } catch { Write-Log 'ERROR' "Printer (prep): $($_.Exception.Message)" }
 }
 
-# WebAgent roda na FASE 7 — e' msiexec, espera o pool (Ninite) p/ nao colidir no mutex.
+# WebAgent runs in PHASE 7 - it is msiexec, waits for the pool (Ninite) so they don't collide on the mutex.
 
 # ============================================================
-# FASE 6 — Assinatura Outlook
+# PHASE 6 - Outlook signature
 # ============================================================
+Set-Phase 'Phase 6 - Outlook signature'
 
 if ($SectorName -and $SectorName -notmatch '^\(') {
     try {
         $sectorPath = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
 
-        if ($SigTemplate -eq '(Automatico — primeiro encontrado)') {
+        if ($SigTemplate -eq '(Automatic - first found)') {
             $srcFile = Get-ChildItem -Path $sectorPath -Filter '*.htm' -ErrorAction SilentlyContinue |
                        Where-Object { $_.Name -notmatch '^[._]' } | Select-Object -First 1
         } else {
@@ -611,11 +792,11 @@ if ($SectorName -and $SectorName -notmatch '^\(') {
         if ($srcFile) {
             $content = [System.IO.File]::ReadAllText($srcFile.FullName, [System.Text.Encoding]::UTF8)
 
-            # Detecta email antigo
+            # Detect the old email
             $emailMatch = [regex]::Match($content, '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
             $oldEmail   = if ($emailMatch.Success) { $emailMatch.Value } else { '' }
 
-            # Detecta nome antigo no span bold
+            # Detect the old name in the bold span
             $nameMatch  = [regex]::Match($content, 'font-weight:\s*bold[^>]*>([^<]+)')
             $oldName    = if ($nameMatch.Success) { $nameMatch.Groups[1].Value.Trim() } else { '' }
 
@@ -627,50 +808,57 @@ if ($SectorName -and $SectorName -notmatch '^\(') {
             New-Item -ItemType Directory -Path $sigFolder -Force | Out-Null
             [System.IO.File]::WriteAllText("$sigFolder\$Username.htm", $newContent, [System.Text.Encoding]::UTF8)
 
-            Write-Log 'OK' "Assinatura criada: $sigFolder\$Username.htm"
+            Write-Log 'OK' "Signature created: $sigFolder\$Username.htm"
             Write-Log 'INFO' "Base: $($srcFile.Name) | '$oldName' -> '$FullName' | '$oldEmail' -> '$Email'"
         } else {
-            Write-Log 'WARN' "Nenhum .htm encontrado em: $sectorPath"
+            Write-Log 'WARN' "No .htm found in: $sectorPath"
         }
-    } catch { Write-Log 'ERROR' "Assinatura: $($_.Exception.Message)" }
+    } catch { Write-Log 'ERROR' "Signature: $($_.Exception.Message)" }
 } else {
-    Write-Log 'INFO' "Assinatura ignorada"
+    Write-Log 'INFO' "Signature skipped"
 }
 
 # ============================================================
-# FASE 7 — Join dos instaladores + passos dependentes + checklist
+# PHASE 7 - Join the installers + dependent steps + checklist
 # ============================================================
+Set-Phase 'Phase 7 - finishing installers and dependent steps'
 
-# Join: espera cada instalador do pool terminar e avalia o exit code.
+# Join: wait for each pool installer to finish and evaluate its exit code.
+# Wait-ProcPumping keeps the live window responsive (replaces blocking WaitForExit).
 foreach ($bgItem in $BgInstalls) {
     try {
-        $bgItem.Proc.WaitForExit()
+        Wait-ProcPumping $bgItem.Proc
         Write-ProcResult $bgItem.Name $bgItem.Proc $bgItem.OkCodes
     } catch { Write-Log 'ERROR' "$($bgItem.Name) (join): $($_.Exception.Message)" }
 }
 
-# Impressora: o driver Epson ja terminou (join acima). Poll curto pelo registro do
-# driver (pode atrasar segundos apos o instalador sair) e adiciona a impressora.
+# Printer: the Epson driver already finished (join above). Short poll for the driver
+# registration (it can lag a few seconds after the installer exits) and add the printer.
 if ($SelectedPrinter -and $script:PrinterPort) {
     try {
         $driverName = $null
         for ($d = 0; $d -lt 30 -and -not $driverName; $d++) {
             $driverObj = Get-PrinterDriver -ErrorAction SilentlyContinue |
                          Where-Object { $_.Name -match 'Epson' } | Select-Object -First 1
-            if ($driverObj) { $driverName = $driverObj.Name } else { Start-Sleep -Milliseconds 500 }
+            if ($driverObj) {
+                $driverName = $driverObj.Name
+            } else {
+                if ($script:UI) { [System.Windows.Forms.Application]::DoEvents() }
+                [System.Threading.Thread]::Sleep(500)
+            }
         }
         if ($driverName) {
             Add-Printer -Name $SelectedPrinter.name -DriverName $driverName `
                         -PortName $script:PrinterPort -ErrorAction Stop | Out-Null
-            Write-Log 'OK' "Impressora: $($SelectedPrinter.name) [$($SelectedPrinter.ip)]"
+            Write-Log 'OK' "Printer: $($SelectedPrinter.name) [$($SelectedPrinter.ip)]"
         } else {
-            Write-Log 'WARN' "Driver Epson nao localizado — adicionar impressora manualmente"
+            Write-Log 'WARN' "Epson driver not located - add the printer manually"
         }
-    } catch { Write-Log 'ERROR' "Impressora: $($_.Exception.Message)" }
+    } catch { Write-Log 'ERROR' "Printer: $($_.Exception.Message)" }
 }
 
-# WebAgent (msiexec) — agora o pool/Ninite terminou, o mutex do Installer esta livre.
-# Tenta MSI > ZIP (extrai MSI) > EXE legacy.
+# WebAgent (msiexec) - the pool/Ninite finished now, so the Installer mutex is free.
+# Tries MSI > ZIP (extracts MSI) > legacy EXE.
 if ($InstallWebAgent) {
     try {
         $waMsi = Get-ChildItem -Path $PathWebAgent -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -680,27 +868,30 @@ if ($InstallWebAgent) {
         if ($waMsi) {
             Write-Log 'INFO' "WebAgent MSI: $($waMsi.Name)"
             $p = Start-Process -FilePath 'msiexec.exe' `
-                 -ArgumentList '/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
+                 -ArgumentList '/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart' -PassThru
+            Wait-ProcPumping $p
             Write-ProcResult 'WebAgent (MSI)' $p @(0, 3010)
         } elseif ($waZip) {
-            Write-Log 'INFO' "WebAgent ZIP: $($waZip.Name) — extraindo..."
+            Write-Log 'INFO' "WebAgent ZIP: $($waZip.Name) - extracting..."
             $extractDir = "$env:TEMP\webagent_extract"
             New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
             Expand-Archive -Path $waZip.FullName -DestinationPath $extractDir -Force
             $msiInZip = Get-ChildItem -Path $extractDir -Filter '*.msi' -Recurse | Select-Object -First 1
             if ($msiInZip) {
                 $p = Start-Process -FilePath 'msiexec.exe' `
-                     -ArgumentList '/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
+                     -ArgumentList '/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart' -PassThru
+                Wait-ProcPumping $p
                 Write-ProcResult 'WebAgent (ZIP)' $p @(0, 3010)
             } else {
-                Write-Log 'WARN' "MSI nao encontrado dentro do ZIP"
+                Write-Log 'WARN' "No MSI found inside the ZIP"
             }
         } elseif ($waExe) {
             Write-Log 'INFO' "WebAgent EXE (legacy): $($waExe.Name)"
-            $p = Start-Process -FilePath $waExe.FullName -ArgumentList '/S' -Wait -PassThru
+            $p = Start-Process -FilePath $waExe.FullName -ArgumentList '/S' -PassThru
+            Wait-ProcPumping $p
             Write-ProcResult 'WebAgent (EXE)' $p
         } else {
-            Write-Log 'WARN' "Instalador WebAgent nao encontrado em $PathWebAgent"
+            Write-Log 'WARN' "WebAgent installer not found in $PathWebAgent"
         }
     } catch { Write-Log 'ERROR' "WebAgent: $($_.Exception.Message)" }
 }
@@ -708,55 +899,63 @@ if ($InstallWebAgent) {
 $checklist = @"
 
 ========================================
-  CHECKLIST MANUAL POS-SETUP
+  POST-SETUP MANUAL CHECKLIST
 ========================================
-Usuario  : $Username ($FullName)
+User     : $Username ($FullName)
 Email    : $Email
-Data     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-PC nome  : $env:COMPUTERNAME
+Date     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+PC name  : $env:COMPUTERNAME
 
-PENDENCIAS:
-[ ] REBOOT para aplicar novo nome do PC
-[ ] Registrar maquina na intranet
-[ ] Login Office 365: $Email
-[ ] Verificar assinatura no Outlook
-[ ] Testar impressora: $(if ($SelectedPrinter) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { 'Nenhuma' })
-[ ] TOTVS (se solicitado no ticket)
-[ ] Entregar credenciais: login=$Username / senha=(ver config.ps1 — nao registrar em log)
+PENDING:
+[ ] REBOOT to apply the new PC name
+[ ] Register the machine on the intranet
+[ ] Office 365 login: $Email
+[ ] Verify the signature in Outlook
+[ ] Test the printer: $(if ($SelectedPrinter) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { 'None' })
+[ ] TOTVS (if requested in the ticket)
+[ ] Hand over credentials: login=$Username / password=(see config.ps1 - do not record in the log)
 ========================================
 Log: $LogFile
 "@
 
 Add-Content -Path $LogFile -Value $checklist -Encoding UTF8 -ErrorAction SilentlyContinue
 
-# MessageBox e modal e BLOQUEIA — so mostra no modo interativo. No -Unattended
-# (hands-free via autounattend) o popup travaria o fluxo, entao some.
-if (-not $Unattended) {
-    [System.Windows.Forms.MessageBox]::Show(
-        $checklist,
-        'Setup — Concluido',
-        'OK',
-        'Information'
-    ) | Out-Null
+# Show the checklist in the live window (replaces the modal checklist popup), appended
+# directly to the RichTextBox so it is NOT duplicated in the log file (Add-Content already
+# wrote it once above). Then flip the window to its "done, you may close" state.
+if ($script:UI) {
+    try {
+        $rtb = $script:UI.Log
+        $rtb.SelectionStart = $rtb.TextLength
+        $rtb.SelectionColor = $script:LevelClr.INFO
+        $rtb.AppendText($checklist + "`n")
+        $rtb.SelectionColor = $rtb.ForeColor
+        $rtb.ScrollToCaret()
+        [System.Windows.Forms.Application]::DoEvents()
+    } catch { }
 }
+Complete-ProgressUI
 
 if ($script:Erros.Count -gt 0) {
     $s = if ($script:Erros.Count -ne 1) { 's' } else { '' }
-    $errSummary = "ATENCAO: $($script:Erros.Count) erro$s durante o setup:`n`n" +
+    $errSummary = "ATTENTION: $($script:Erros.Count) error$s during setup:`n`n" +
                   ($script:Erros -join "`n") +
-                  "`n`nLog completo: $LogFile"
-    Write-Log 'INFO' "Setup concluido com $($script:Erros.Count) erro$s"
-    if (-not $Unattended) {
+                  "`n`nFull log: $LogFile"
+    Write-Log 'INFO' "Setup completed with $($script:Erros.Count) error$s"
+    # Modal error summary forces acknowledgement (interactive only).
+    if ($script:UI) {
         [System.Windows.Forms.MessageBox]::Show(
             $errSummary,
-            'Setup — Erros Encontrados',
+            'Setup - Errors Found',
             'OK',
             'Warning'
         ) | Out-Null
     }
-    # Sinaliza falha ao chamador (run.bat / FirstLogonCommands checam %errorlevel%).
+    Wait-WindowClosed
+    # Signals failure to the caller (run.bat / FirstLogonCommands check %errorlevel%).
     exit 1
 } else {
-    Write-Log 'OK' "setup.ps1 concluido sem erros"
+    Write-Log 'OK' "setup.ps1 completed without errors"
+    Wait-WindowClosed
     exit 0
 }
