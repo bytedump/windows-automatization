@@ -22,6 +22,15 @@ $LogFile      = "$env:USERPROFILE\Desktop\win11_setup_log.txt"
 $ScriptDir    = $PSScriptRoot
 $script:Erros = [System.Collections.Generic.List[string]]::new()
 
+# Live-progress UI state. The input form is modal (ShowDialog) on the main thread; the
+# work (PHASE 4-7) runs here on the main thread, while a SEPARATE STA runspace shows a
+# progress window with a real message loop (Application.Run) and a Timer that drains the
+# log queue. So heavy work never blocks the window -> no "not responding". All three are
+# $null when headless (-Unattended) -> every UI touch no-ops and behavior matches the original.
+$script:LogQueue = $null   # ConcurrentQueue[object] of {Level, Line}; $null = headless
+$script:UiState  = $null   # synchronized hashtable: { Done, Status }
+$script:ProgUI   = $null   # @{ PS; Handle; Runspace } for the progress runspace
+
 function Write-Log {
     param([string]$Level, [string]$Msg)
     $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -31,30 +40,15 @@ function Write-Log {
     if ($Level -in 'ERROR', 'FATAL') {
         $script:Erros.Add("[$Level] $Msg") | Out-Null
     }
-
-    # --- Tee into the live-progress window (only if the UI exists) ---
-    # Single choke point: every phase streams here for free. Headless ($script:UI = $null)
-    # makes this a no-op, so -Unattended behaves exactly like before (file + host only).
-    if ($script:UI) {
-        try {
-            $rtb = $script:UI.Log
-            $clr = $script:LevelClr[$Level]; if (-not $clr) { $clr = $script:LevelClr.INFO }
-            $rtb.SelectionStart  = $rtb.TextLength
-            $rtb.SelectionLength  = 0
-            $rtb.SelectionColor  = $clr
-            $rtb.AppendText($line + "`n")
-            $rtb.SelectionColor  = $rtb.ForeColor             # reset so the next line is default
-            $rtb.ScrollToCaret()                              # read-only RTB never focuses: needed to autoscroll
-            if ($rtb.Lines.Count -gt 5000) {                  # cap growth on long runs
-                $rtb.ReadOnly = $false
-                $rtb.Select(0, $rtb.GetFirstCharIndexFromLine(1000))
-                $rtb.SelectedText = ''
-                $rtb.ReadOnly = $true
-                $rtb.SelectionStart = $rtb.TextLength
-            }
-            [System.Windows.Forms.Application]::DoEvents()    # repaint + process window messages
-        } catch { }   # the tee must never break logging (runs inside catch/trap blocks)
+    # Tee to the progress window: enqueue (thread-safe). The runspace Timer drains it.
+    if ($script:LogQueue) {
+        try { $script:LogQueue.Enqueue([pscustomobject]@{ Level = $Level; Line = $line }) } catch { }
     }
+}
+
+# Updates the progress-window status caption (drained by the Timer). No-op when headless.
+function Set-Phase([string]$text) {
+    if ($script:UiState) { $script:UiState.Status = $text }
 }
 
 # Evaluates an installer exit code and logs OK/ERROR (instead of assuming OK).
@@ -75,20 +69,18 @@ function Write-ProcResult {
 trap {
     $msg = "Unhandled fatal error at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
     Write-Log 'FATAL' $msg
-    # If the window is up, let the technician read the fatal line before we exit.
-    if ($script:UI) { try { Complete-ProgressUI; Wait-WindowClosed } catch { } }
+    # If the progress window is up, let the technician read the fatal line before we exit.
+    if ($script:ProgUI) {
+        try {
+            $script:UiState.Status = 'FATAL error - review the log above, then close.'
+            $script:UiState.Done   = $true
+            $script:ProgUI.PS.EndInvoke($script:ProgUI.Handle)
+        } catch { }
+    }
     exit 1
 }
 
-# UI state is initialized BEFORE Add-Type so Write-Log's tee guard (and the trap) are safe
-# even if Add-Type itself throws: its catch calls Write-Log, whose `if ($script:UI)` would
-# otherwise read an unset variable and blow up under StrictMode. $script:LevelClr needs
-# System.Drawing, so it is defined right AFTER the assemblies load (just below).
-$script:UI      = $null     # control handles; $null = headless (no window)
-$script:Started = $false    # flipped by the Start button click handler
-
-# GUI assemblies are loaded up front so the live-progress window (and the color table
-# below) can be built anywhere. Failure here is fatal: nothing downstream works without them.
+# GUI assemblies for the input form (ShowDialog) on the main thread. Failure is fatal.
 try {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
@@ -97,299 +89,128 @@ try {
     exit 1
 }
 
-# ============================================================
-# Live-progress UI - single window: input form on top, streaming log at the bottom
-# ============================================================
-# Approach: single-threaded, modeless Form + RichTextBox fed by Write-Log, with
-# Application.DoEvents() acting as a hand-rolled message pump (no Application.Run, no
-# runspaces). The technician fills the form on top; the section below streams every task
-# live. $script:UI = $null means headless (no window) and every UI touch becomes a no-op.
-# ($script:UI / $script:Started are initialized above, before Add-Type.)
-
-# Color per log level (uses System.Drawing, loaded just above).
-$script:LevelClr = @{
-    OK    = [System.Drawing.Color]::FromArgb(80, 220, 100)
-    WARN  = [System.Drawing.Color]::FromArgb(235, 200, 60)
-    ERROR = [System.Drawing.Color]::FromArgb(240, 90, 90)
-    FATAL = [System.Drawing.Color]::FromArgb(255, 70, 70)
-    INFO  = [System.Drawing.Color]::FromArgb(185, 185, 185)
+# --- Input-form helpers (used by the PHASE 3 ShowDialog form, at script scope) ---
+function Add-Label([System.Windows.Forms.Control]$c, [string]$text, [int]$x, [int]$y) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text     = $text
+    $l.Location = New-Object System.Drawing.Point($x, $y)
+    $l.AutoSize = $true
+    $c.Controls.Add($l)
+}
+function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Location = New-Object System.Drawing.Point($x, $y)
+    $t.Size     = New-Object System.Drawing.Size($w, 23)
+    return $t
+}
+function New-Combo([int]$x, [int]$y, [int]$w = 480) {
+    $cb = New-Object System.Windows.Forms.ComboBox
+    $cb.Location      = New-Object System.Drawing.Point($x, $y)
+    $cb.Size          = New-Object System.Drawing.Size($w, 23)
+    $cb.DropDownStyle = 'DropDownList'
+    return $cb
 }
 
-# Status caption + pump (cosmetic; safe when headless).
-function Set-Phase([string]$text) {
-    if ($script:UI) {
-        $script:UI.Status.Text = $text
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-}
+# Launches the progress window in its own STA runspace. The window runs a real message loop
+# (Application.Run) so it stays responsive while the main thread does heavy work; a Timer
+# drains $script:LogQueue into the colored RichTextBox and reflects $script:UiState. Returns
+# the runspace handles so the caller can mark Done and wait for the user to close the window.
+function Start-ProgressWindow {
+    $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    $script:UiState  = [hashtable]::Synchronized(@{ Done = $false; Status = 'Starting setup...' })
 
-# Polls a process to completion while pumping the window (replaces blocking WaitForExit /
-# Start-Process -Wait, which would freeze a modeless window). Thread.Sleep (NOT Start-Sleep:
-# Start-Sleep inside a DoEvents loop breaks Alt-Tab / taskbar reactivation - PowerShell#19796).
-function Wait-ProcPumping($Proc) {
-    while (-not $Proc.HasExited) {
-        if ($script:UI) { [System.Windows.Forms.Application]::DoEvents() }
-        [System.Threading.Thread]::Sleep(200)
-    }
-}
+    $uiScript = {
+        param($Queue, $State)
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
 
-# End state: stop the marquee, enable Close, then pump until the technician closes the window.
-function Complete-ProgressUI {
-    if (-not $script:UI) { return }
-    $script:UI.Bar.Style    = 'Continuous'
-    $script:UI.Bar.Value    = $script:UI.Bar.Maximum
-    $script:UI.Close.Enabled = $true
-    $script:UI.Status.Text  = 'Done - you may close this window.'
-    [System.Windows.Forms.Application]::DoEvents()
-}
-
-function Wait-WindowClosed {
-    if (-not $script:UI) { return }
-    while ($script:UI -and -not $script:UI.Form.IsDisposed) {
-        [System.Windows.Forms.Application]::DoEvents()
-        [System.Threading.Thread]::Sleep(100)
-    }
-}
-
-# Builds the single window (form on top + live log at the bottom), wires the dynamic
-# combo events and the Start button, shows it modeless and pumps once. Reads $Printers,
-# $EmailDomains and $PathSignatures from the enclosing script scope (set before this runs).
-# IMPORTANT: this MUST be invoked dot-sourced ('. Show-MainWindow') so the control variables
-# land in the script scope and the event handlers can still see them when they fire later.
-function Show-MainWindow {
-    $f = New-Object System.Windows.Forms.Form
-    $f.Text            = 'New Machine Setup'
-    $f.Size            = New-Object System.Drawing.Size(580, 880)
-    $f.StartPosition   = 'CenterScreen'
-    $f.FormBorderStyle = 'Sizable'
-    $f.MinimizeBox     = $true
-    $f.MaximizeBox     = $true
-
-    # --- bottom: live log panel (added first so Dock=Fill yields the right remaining space) ---
-    $logPanel = New-Object System.Windows.Forms.Panel
-    $logPanel.Dock   = 'Bottom'
-    $logPanel.Height = 300
-
-    $status = New-Object System.Windows.Forms.Label
-    $status.Dock      = 'Top'
-    $status.Height    = 24
-    $status.TextAlign = 'MiddleLeft'
-    $status.Padding   = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
-    $status.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
-    $status.Text      = 'Fill in the form and click Start.'
-
-    $bar = New-Object System.Windows.Forms.ProgressBar
-    $bar.Dock                  = 'Top'
-    $bar.Height                = 16
-    $bar.Style                 = 'Marquee'
-    $bar.MarqueeAnimationSpeed = 30
-
-    $rtb = New-Object System.Windows.Forms.RichTextBox
-    $rtb.Dock       = 'Fill'
-    $rtb.ReadOnly   = $true
-    $rtb.BackColor  = [System.Drawing.Color]::FromArgb(20, 20, 24)
-    $rtb.ForeColor  = [System.Drawing.Color]::FromArgb(200, 200, 200)
-    $rtb.Font       = New-Object System.Drawing.Font('Consolas', 9)
-    $rtb.WordWrap   = $false
-    $rtb.ScrollBars = 'Both'
-    $rtb.DetectUrls = $false
-
-    $logPanel.Controls.Add($rtb)
-    $logPanel.Controls.Add($bar)
-    $logPanel.Controls.Add($status)
-
-    # --- top: input form (scrolls if the screen is small) ---
-    $inputPanel = New-Object System.Windows.Forms.Panel
-    $inputPanel.Dock      = 'Fill'
-    $inputPanel.AutoScroll = $true
-
-    function Add-Label([System.Windows.Forms.Control]$c, [string]$text, [int]$x, [int]$y) {
-        $l = New-Object System.Windows.Forms.Label
-        $l.Text     = $text
-        $l.Location = New-Object System.Drawing.Point($x, $y)
-        $l.AutoSize = $true
-        $c.Controls.Add($l)
-    }
-    function New-TextBox([int]$x, [int]$y, [int]$w = 480) {
-        $t = New-Object System.Windows.Forms.TextBox
-        $t.Location = New-Object System.Drawing.Point($x, $y)
-        $t.Size     = New-Object System.Drawing.Size($w, 23)
-        return $t
-    }
-    function New-Combo([int]$x, [int]$y, [int]$w = 480) {
-        $cb = New-Object System.Windows.Forms.ComboBox
-        $cb.Location      = New-Object System.Drawing.Point($x, $y)
-        $cb.Size          = New-Object System.Drawing.Size($w, 23)
-        $cb.DropDownStyle = 'DropDownList'
-        return $cb
-    }
-
-    $y = 12
-
-    Add-Label $inputPanel 'Full name (from the ticket):' 10 $y; $y += 20
-    $TxtFullName = New-TextBox 10 $y; $inputPanel.Controls.Add($TxtFullName); $y += 35
-
-    Add-Label $inputPanel 'Username (e.g. joao.silva):' 10 $y; $y += 20
-    $TxtUsername = New-TextBox 10 $y; $inputPanel.Controls.Add($TxtUsername); $y += 35
-
-    Add-Label $inputPanel 'Email domain:' 10 $y; $y += 20
-    $CmbDomain = New-Combo 10 $y 300
-    $EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
-    $CmbDomain.SelectedIndex = 0
-    $inputPanel.Controls.Add($CmbDomain); $y += 35
-
-    Add-Label $inputPanel 'Network configuration:' 10 $y; $y += 20
-    $RadioDhcp            = New-Object System.Windows.Forms.RadioButton
-    $RadioDhcp.Text       = 'DHCP (automatic)'
-    $RadioDhcp.Location   = New-Object System.Drawing.Point(10, $y)
-    $RadioDhcp.AutoSize   = $true
-    $RadioDhcp.Checked    = $true
-    $RadioStatic          = New-Object System.Windows.Forms.RadioButton
-    $RadioStatic.Text     = 'Static IP'
-    $RadioStatic.Location = New-Object System.Drawing.Point(190, $y)
-    $RadioStatic.AutoSize = $true
-    $inputPanel.Controls.Add($RadioDhcp); $inputPanel.Controls.Add($RadioStatic); $y += 30
-
-    $LblIp          = New-Object System.Windows.Forms.Label
-    $LblIp.Text     = 'IP (e.g. 10.0.X.X):'
-    $LblIp.Location = New-Object System.Drawing.Point(10, $y)
-    $LblIp.AutoSize = $true
-    $LblIp.Visible  = $false
-    $TxtIp          = New-TextBox 140 $y 160
-    $TxtIp.Visible  = $false
-    $inputPanel.Controls.Add($LblIp); $inputPanel.Controls.Add($TxtIp); $y += 35
-
-    $RadioStatic.Add_CheckedChanged({ $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
-    $RadioDhcp.Add_CheckedChanged({   $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
-
-    Add-Label $inputPanel 'Main printer:' 10 $y; $y += 20
-    $CmbPrinter = New-Combo 10 $y
-    $CmbPrinter.Items.Add('(None)') | Out-Null
-    foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
-    $CmbPrinter.SelectedIndex = 0
-    $inputPanel.Controls.Add($CmbPrinter); $y += 35
-
-    Add-Label $inputPanel 'Sector (for the signature):' 10 $y; $y += 20
-    $CmbSector = New-Combo 10 $y
-    $inputPanel.Controls.Add($CmbSector); $y += 35
-
-    Add-Label $inputPanel 'Base signature (.htm):' 10 $y; $y += 20
-    $CmbSigTemplate = New-Combo 10 $y
-    $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
-    $CmbSigTemplate.SelectedIndex = 0
-    $inputPanel.Controls.Add($CmbSigTemplate); $y += 35
-
-    $ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
-    $ChkWebAgent.Text     = 'Install WebAgent'
-    $ChkWebAgent.Location = New-Object System.Drawing.Point(10, $y)
-    $ChkWebAgent.AutoSize = $true
-    $inputPanel.Controls.Add($ChkWebAgent); $y += 40
-
-    $BtnStart          = New-Object System.Windows.Forms.Button
-    $BtnStart.Text     = 'Start setup'
-    $BtnStart.Location = New-Object System.Drawing.Point(10, $y)
-    $BtnStart.Size     = New-Object System.Drawing.Size(480, 35)
-    $inputPanel.Controls.Add($BtnStart)
-
-    # Event: domain changes -> reload sectors
-    $CmbDomain.Add_SelectedIndexChanged({
-        if ($CmbDomain.SelectedIndex -lt 0) { return }
-        $d  = $CmbDomain.SelectedItem.ToString()
-        $dp = Join-Path $PathSignatures $d
-        $CmbSector.Items.Clear()
-        if (Test-Path $dp) {
-            $dirs = @(Get-ChildItem -Path $dp -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-            if ($dirs.Count -gt 0) { $dirs | ForEach-Object { $CmbSector.Items.Add($_) | Out-Null } }
-            else { $CmbSector.Items.Add('(No sectors)') | Out-Null }
-        } else {
-            $CmbSector.Items.Add('(Folder not found)') | Out-Null
+        $clr = @{
+            OK    = [System.Drawing.Color]::FromArgb(80, 220, 100)
+            WARN  = [System.Drawing.Color]::FromArgb(235, 200, 60)
+            ERROR = [System.Drawing.Color]::FromArgb(240, 90, 90)
+            FATAL = [System.Drawing.Color]::FromArgb(255, 70, 70)
+            INFO  = [System.Drawing.Color]::FromArgb(190, 190, 190)
         }
-        if ($CmbSector.Items.Count -gt 0) { $CmbSector.SelectedIndex = 0 }
-    })
 
-    # Event: sector changes -> reload available .htm files
-    $CmbSector.Add_SelectedIndexChanged({
-        if ($CmbSector.SelectedIndex -lt 0 -or -not $CmbDomain.SelectedItem) { return }
-        $d = $CmbDomain.SelectedItem.ToString()
-        $s = $CmbSector.SelectedItem.ToString()
-        $CmbSigTemplate.Items.Clear()
-        $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
-        if ($s -notmatch '^\(') {
-            $sp = Join-Path (Join-Path $PathSignatures $d) $s
-            if (Test-Path $sp) {
-                Get-ChildItem -Path $sp -Filter '*.htm' -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -notmatch '^[._]' } |
-                    ForEach-Object { $CmbSigTemplate.Items.Add($_.Name) | Out-Null }
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text          = 'Setup - Progress'
+        $form.Size          = New-Object System.Drawing.Size(780, 560)
+        $form.StartPosition = 'CenterScreen'
+
+        $status = New-Object System.Windows.Forms.Label
+        $status.Dock      = 'Top'
+        $status.Height    = 24
+        $status.TextAlign = 'MiddleLeft'
+        $status.Padding   = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+        $status.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $status.Text      = $State.Status
+
+        $bar = New-Object System.Windows.Forms.ProgressBar
+        $bar.Dock                  = 'Top'
+        $bar.Height                = 16
+        $bar.Style                 = 'Marquee'
+        $bar.MarqueeAnimationSpeed = 30
+
+        $rtb = New-Object System.Windows.Forms.RichTextBox
+        $rtb.Dock       = 'Fill'
+        $rtb.ReadOnly   = $true
+        $rtb.BackColor  = [System.Drawing.Color]::FromArgb(20, 20, 24)
+        $rtb.ForeColor  = [System.Drawing.Color]::FromArgb(200, 200, 200)
+        $rtb.Font       = New-Object System.Drawing.Font('Consolas', 9)
+        $rtb.WordWrap   = $false
+        $rtb.ScrollBars = 'Both'
+        $rtb.DetectUrls = $false
+
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Dock    = 'Bottom'
+        $btn.Height  = 34
+        $btn.Text    = 'Close'
+        $btn.Enabled = $false
+        $btn.Add_Click({ $form.Close() })
+
+        # Dock order: Fill control added first, edges after -> log fills, status/bar on top, Close at bottom.
+        $form.Controls.Add($rtb)
+        $form.Controls.Add($bar)
+        $form.Controls.Add($status)
+        $form.Controls.Add($btn)
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 200
+        $timer.Add_Tick({
+            $item = $null
+            while ($Queue.TryDequeue([ref]$item)) {
+                $c = $clr[$item.Level]; if (-not $c) { $c = $clr['INFO'] }
+                $rtb.SelectionStart  = $rtb.TextLength
+                $rtb.SelectionLength = 0
+                $rtb.SelectionColor  = $c
+                $rtb.AppendText($item.Line + "`n")
+                $rtb.SelectionColor  = $rtb.ForeColor
+                $rtb.ScrollToCaret()
             }
-        }
-        $CmbSigTemplate.SelectedIndex = 0
-    })
+            $status.Text = $State.Status
+            if ($State.Done) {
+                $bar.Style   = 'Continuous'
+                $bar.Value   = $bar.Maximum
+                $btn.Enabled = $true
+            }
+        })
+        $timer.Start()
 
-    # Start: validate, copy values to script scope, lock inputs, flip $Started.
-    # The work runs in the main flow (NOT in this handler) so no interactive control is
-    # enabled during the run -> no DoEvents re-entrancy. The window is NOT closed.
-    $BtnStart.Add_Click({
-        if (-not $TxtFullName.Text.Trim()) {
-            [System.Windows.Forms.MessageBox]::Show('Fill in the full name.', 'Setup', 'OK', 'Warning') | Out-Null; return
-        }
-        if (-not $TxtUsername.Text.Trim()) {
-            [System.Windows.Forms.MessageBox]::Show('Fill in the username.', 'Setup', 'OK', 'Warning') | Out-Null; return
-        }
-        if ($RadioStatic.Checked -and -not $TxtIp.Text.Trim()) {
-            [System.Windows.Forms.MessageBox]::Show('Fill in the static IP.', 'Setup', 'OK', 'Warning') | Out-Null; return
-        }
-
-        $script:FullName    = $TxtFullName.Text.Trim()
-        $script:Username    = $TxtUsername.Text.Trim().ToLower()
-        $script:EmailDomain = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { $EmailDomains[0] }
-        $script:Email       = "$($script:Username)@$($script:EmailDomain)"
-        $script:UseStatic   = $RadioStatic.Checked
-        $script:StaticIp    = if ($RadioStatic.Checked) { $TxtIp.Text.Trim() } else { '' }
-        $pidx               = $CmbPrinter.SelectedIndex
-        $script:SelectedPrinter = if ($pidx -gt 0) { $Printers[$pidx - 1] } else { $null }
-        $script:SectorName  = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
-        $script:SigTemplate = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
-        $script:InstallWebAgent = $ChkWebAgent.Checked
-
-        $BtnStart.Enabled = $false
-        foreach ($ctl in $script:UI.Inputs) { $ctl.Enabled = $false }
-        $script:UI.Status.Text = 'Running setup...'
-        $script:Started = $true
-    })
-
-    # Initial load: fire the domain event to populate sectors and templates
-    $CmbDomain.SelectedIndex = -1
-    $CmbDomain.SelectedIndex = 0
-
-    # Closing the window mid-run just drops the UI reference; the run keeps going (log
-    # falls back to file + host). We never abort a half-provisioned machine on a window close.
-    $f.Add_FormClosed({ $script:UI = $null })
-
-    $f.Controls.Add($inputPanel)
-    $f.Controls.Add($logPanel)
-
-    $script:UI = @{
-        Form   = $f
-        Log    = $rtb
-        Bar    = $bar
-        Status = $status
-        Close  = $BtnStart   # placeholder; replaced just below by a dedicated Close button
-        Inputs = @($TxtFullName, $TxtUsername, $CmbDomain, $RadioDhcp, $RadioStatic, $TxtIp,
-                   $CmbPrinter, $CmbSector, $CmbSigTemplate, $ChkWebAgent)
+        [System.Windows.Forms.Application]::Run($form)   # real message loop: stays responsive
+        $timer.Stop()
     }
 
-    # Dedicated Close button at the bottom of the log panel (disabled until the run finishes).
-    $btnClose = New-Object System.Windows.Forms.Button
-    $btnClose.Dock    = 'Bottom'
-    $btnClose.Height  = 34
-    $btnClose.Text    = 'Close'
-    $btnClose.Enabled = $false
-    $btnClose.Add_Click({ if ($script:UI) { $script:UI.Form.Close() } })
-    $logPanel.Controls.Add($btnClose)
-    $script:UI.Close = $btnClose
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'                # required for WinForms
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
 
-    $f.Show()                                          # modeless: returns immediately
-    [System.Windows.Forms.Application]::DoEvents()      # force the first paint
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    $null = $ps.AddScript($uiScript).AddArgument($script:LogQueue).AddArgument($script:UiState)
+    $handle = $ps.BeginInvoke()
+
+    $script:ProgUI = [pscustomobject]@{ PS = $ps; Handle = $handle; Runspace = $rs }
 }
 
 # ============================================================
@@ -565,47 +386,170 @@ if (Test-Path $NinitePath) {
 }
 
 # ============================================================
-# PHASE 3 - Collect inputs (single live window) or resolve from -Test* params
+# PHASE 3 - Collect inputs (modal input form) or resolve from -Test* params
 # ============================================================
-# Interactive: show the single window (form + live log) and wait, via a hand-rolled DoEvents
-# pump, until the technician clicks Start. Headless ($Unattended, or no interactive desktop):
-# values come from the -Test* params and no window is shown.
+# Interactive: a MODAL input form (ShowDialog = real message loop, rock-solid - no DoEvents).
+# It only collects values, then closes. The live progress window is launched afterwards in a
+# separate runspace (see Start-ProgressWindow). Headless ($Unattended / no desktop): values
+# come from -Test* params and no window is shown.
 
 $useUI = (-not $Unattended) -and [System.Environment]::UserInteractive
 
 if ($useUI) {
-    try {
-        # DOT-SOURCED on purpose: '. Show-MainWindow' runs the function body in THIS (script)
-        # scope, so the control variables ($CmbDomain, $LblIp, ...) live at script scope. The
-        # form's event handlers fire later (after the function returns) on the message pump;
-        # if the controls were function-locals they'd be gone by then and every handler would
-        # throw "variable ... cannot be retrieved". Dot-sourcing keeps them reachable.
-        . Show-MainWindow
-        while (-not $script:Started -and $script:UI -and -not $script:UI.Form.IsDisposed) {
-            [System.Windows.Forms.Application]::DoEvents()
-            [System.Threading.Thread]::Sleep(50)
+try {
+
+$Form = New-Object System.Windows.Forms.Form
+$Form.Text            = 'New Machine Setup'
+$Form.Size            = New-Object System.Drawing.Size(520, 640)
+$Form.StartPosition   = 'CenterScreen'
+$Form.FormBorderStyle = 'FixedDialog'
+$Form.MaximizeBox     = $false
+
+$y = 12
+
+Add-Label $Form 'Full name (from the ticket):' 10 $y; $y += 20
+$TxtFullName = New-TextBox 10 $y; $Form.Controls.Add($TxtFullName); $y += 35
+
+Add-Label $Form 'Username (e.g. joao.silva):' 10 $y; $y += 20
+$TxtUsername = New-TextBox 10 $y; $Form.Controls.Add($TxtUsername); $y += 35
+
+Add-Label $Form 'Email domain:' 10 $y; $y += 20
+$CmbDomain = New-Combo 10 $y 300
+$EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
+$CmbDomain.SelectedIndex = 0
+$Form.Controls.Add($CmbDomain); $y += 35
+
+Add-Label $Form 'Network configuration:' 10 $y; $y += 20
+$RadioDhcp            = New-Object System.Windows.Forms.RadioButton
+$RadioDhcp.Text       = 'DHCP (automatic)'
+$RadioDhcp.Location   = New-Object System.Drawing.Point(10, $y)
+$RadioDhcp.AutoSize   = $true
+$RadioDhcp.Checked    = $true
+$RadioStatic          = New-Object System.Windows.Forms.RadioButton
+$RadioStatic.Text     = 'Static IP'
+$RadioStatic.Location = New-Object System.Drawing.Point(190, $y)
+$RadioStatic.AutoSize = $true
+$Form.Controls.Add($RadioDhcp); $Form.Controls.Add($RadioStatic); $y += 30
+
+$LblIp          = New-Object System.Windows.Forms.Label
+$LblIp.Text     = 'IP (e.g. 10.0.X.X):'
+$LblIp.Location = New-Object System.Drawing.Point(10, $y)
+$LblIp.AutoSize = $true
+$LblIp.Visible  = $false
+$TxtIp          = New-TextBox 140 $y 160
+$TxtIp.Visible  = $false
+$Form.Controls.Add($LblIp); $Form.Controls.Add($TxtIp); $y += 35
+
+$RadioStatic.Add_CheckedChanged({ $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
+$RadioDhcp.Add_CheckedChanged({   $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked })
+
+Add-Label $Form 'Main printer:' 10 $y; $y += 20
+$CmbPrinter = New-Combo 10 $y
+$CmbPrinter.Items.Add('(None)') | Out-Null
+foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
+$CmbPrinter.SelectedIndex = 0
+$Form.Controls.Add($CmbPrinter); $y += 35
+
+Add-Label $Form 'Sector (for the signature):' 10 $y; $y += 20
+$CmbSector = New-Combo 10 $y
+$Form.Controls.Add($CmbSector); $y += 35
+
+Add-Label $Form 'Base signature (.htm):' 10 $y; $y += 20
+$CmbSigTemplate = New-Combo 10 $y
+$CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+$CmbSigTemplate.SelectedIndex = 0
+$Form.Controls.Add($CmbSigTemplate); $y += 35
+
+$ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
+$ChkWebAgent.Text     = 'Install WebAgent'
+$ChkWebAgent.Location = New-Object System.Drawing.Point(10, $y)
+$ChkWebAgent.AutoSize = $true
+$Form.Controls.Add($ChkWebAgent); $y += 40
+
+$BtnOk          = New-Object System.Windows.Forms.Button
+$BtnOk.Text     = 'Start setup'
+$BtnOk.Location = New-Object System.Drawing.Point(10, $y)
+$BtnOk.Size     = New-Object System.Drawing.Size(480, 35)
+$BtnOk.Add_Click({
+    if (-not $TxtFullName.Text.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show('Fill in the full name.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    }
+    if (-not $TxtUsername.Text.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show('Fill in the username.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    }
+    if ($RadioStatic.Checked -and -not $TxtIp.Text.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show('Fill in the static IP.', 'Setup', 'OK', 'Warning') | Out-Null; return
+    }
+    $Form.Tag = 'OK'
+    $Form.Close()
+})
+$Form.Controls.Add($BtnOk)
+
+# Event: domain changes -> reload sectors
+$CmbDomain.Add_SelectedIndexChanged({
+    if ($CmbDomain.SelectedIndex -lt 0) { return }
+    $d  = $CmbDomain.SelectedItem.ToString()
+    $dp = Join-Path $PathSignatures $d
+    $CmbSector.Items.Clear()
+    if (Test-Path $dp) {
+        $dirs = @(Get-ChildItem -Path $dp -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        if ($dirs.Count -gt 0) { $dirs | ForEach-Object { $CmbSector.Items.Add($_) | Out-Null } }
+        else { $CmbSector.Items.Add('(No sectors)') | Out-Null }
+    } else {
+        $CmbSector.Items.Add('(Folder not found)') | Out-Null
+    }
+    if ($CmbSector.Items.Count -gt 0) { $CmbSector.SelectedIndex = 0 }
+})
+
+# Event: sector changes -> reload available .htm files
+$CmbSector.Add_SelectedIndexChanged({
+    if ($CmbSector.SelectedIndex -lt 0 -or -not $CmbDomain.SelectedItem) { return }
+    $d = $CmbDomain.SelectedItem.ToString()
+    $s = $CmbSector.SelectedItem.ToString()
+    $CmbSigTemplate.Items.Clear()
+    $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+    if ($s -notmatch '^\(') {
+        $sp = Join-Path (Join-Path $PathSignatures $d) $s
+        if (Test-Path $sp) {
+            Get-ChildItem -Path $sp -Filter '*.htm' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch '^[._]' } |
+                ForEach-Object { $CmbSigTemplate.Items.Add($_.Name) | Out-Null }
         }
-    } catch {
-        Write-Log 'FATAL' "GUI failed: $($_.Exception.Message)"
-        [System.Windows.Forms.MessageBox]::Show(
-            "Fatal GUI error:`n$($_.Exception.Message)",
-            'Setup - Fatal Error', 'OK', 'Error') | Out-Null
-        exit 1
     }
-    if (-not $script:Started) {
-        Write-Log 'WARN' "Setup cancelled (window closed before Start)"
-        exit 0
-    }
-    $FullName        = $script:FullName
-    $Username        = $script:Username
-    $EmailDomain     = $script:EmailDomain
-    $Email           = $script:Email
-    $UseStatic       = $script:UseStatic
-    $StaticIp        = $script:StaticIp
-    $SelectedPrinter = $script:SelectedPrinter
-    $SectorName      = $script:SectorName
-    $SigTemplate     = $script:SigTemplate
-    $InstallWebAgent = $script:InstallWebAgent
+    $CmbSigTemplate.SelectedIndex = 0
+})
+
+# Initial load: fire the domain event to populate sectors and templates
+$CmbDomain.SelectedIndex = -1
+$CmbDomain.SelectedIndex = 0
+
+$Form.ShowDialog() | Out-Null
+
+if ($Form.Tag -ne 'OK') {
+    Write-Log 'WARN' "Setup cancelled (input form closed)"
+    exit 0
+}
+
+$FullName        = $TxtFullName.Text.Trim()
+$Username        = $TxtUsername.Text.Trim().ToLower()
+$EmailDomain     = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { $EmailDomains[0] }
+$Email           = "$Username@$EmailDomain"
+$UseStatic       = $RadioStatic.Checked
+$StaticIp        = if ($UseStatic) { $TxtIp.Text.Trim() } else { '' }
+$PrinterIdx      = $CmbPrinter.SelectedIndex
+$SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { $null }
+$SectorName      = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
+$SigTemplate     = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
+$InstallWebAgent = $ChkWebAgent.Checked
+
+} catch {
+    Write-Log 'FATAL' "Input GUI failed: $($_.Exception.Message)"
+    [System.Windows.Forms.MessageBox]::Show(
+        "Fatal GUI error:`n$($_.Exception.Message)",
+        'Setup - Fatal Error', 'OK', 'Error') | Out-Null
+    exit 1
+}
+
 } else {
     $EmailDomain     = if ($TestDomain) { $TestDomain } else { $EmailDomains[0] }
     $FullName        = $TestFullName
@@ -625,6 +569,22 @@ if ($useUI) {
 
     $SigTemplate     = '(Automatic - first found)'
     $InstallWebAgent = $TestWebAgent.IsPresent
+}
+
+# Launch the live progress window now (interactive only). From here, every Write-Log streams
+# into it. The work below runs on THIS thread; the window has its own thread + message loop.
+# The window is COSMETIC: if it fails to launch (e.g. STA thread error), degrade to file+host
+# logging - never abort a machine provision over a progress window. Resetting the three UI
+# vars to $null makes the rest of the run behave exactly like the headless path.
+if ($useUI) {
+    try {
+        Start-ProgressWindow
+    } catch {
+        Write-Log 'WARN' "Progress window failed to launch (continuing without it): $($_.Exception.Message)"
+        $script:LogQueue = $null
+        $script:UiState  = $null
+        $script:ProgUI   = $null
+    }
 }
 
 Write-Log 'INFO' "Mode: $(if ($useUI) { 'interactive' } else { 'unattended' })"
@@ -833,11 +793,11 @@ if ($SectorName -and $SectorName -notmatch '^\(') {
 # ============================================================
 Set-Phase 'Phase 7 - finishing installers and dependent steps'
 
-# Join: wait for each pool installer to finish and evaluate its exit code.
-# Wait-ProcPumping keeps the live window responsive (replaces blocking WaitForExit).
+# Join: wait for each pool installer to finish and evaluate its exit code. Blocking is fine -
+# the progress window lives on its own thread, so it stays responsive while we wait here.
 foreach ($bgItem in $BgInstalls) {
     try {
-        Wait-ProcPumping $bgItem.Proc
+        $bgItem.Proc.WaitForExit()
         Write-ProcResult $bgItem.Name $bgItem.Proc $bgItem.OkCodes
     } catch { Write-Log 'ERROR' "$($bgItem.Name) (join): $($_.Exception.Message)" }
 }
@@ -850,12 +810,7 @@ if ($SelectedPrinter -and $script:PrinterPort) {
         for ($d = 0; $d -lt 30 -and -not $driverName; $d++) {
             $driverObj = Get-PrinterDriver -ErrorAction SilentlyContinue |
                          Where-Object { $_.Name -match 'Epson' } | Select-Object -First 1
-            if ($driverObj) {
-                $driverName = $driverObj.Name
-            } else {
-                if ($script:UI) { [System.Windows.Forms.Application]::DoEvents() }
-                [System.Threading.Thread]::Sleep(500)
-            }
+            if ($driverObj) { $driverName = $driverObj.Name } else { Start-Sleep -Milliseconds 500 }
         }
         if ($driverName) {
             Add-Printer -Name $SelectedPrinter.name -DriverName $driverName `
@@ -878,8 +833,7 @@ if ($InstallWebAgent) {
         if ($waMsi) {
             Write-Log 'INFO' "WebAgent MSI: $($waMsi.Name)"
             $p = Start-Process -FilePath 'msiexec.exe' `
-                 -ArgumentList '/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart' -PassThru
-            Wait-ProcPumping $p
+                 -ArgumentList '/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
             Write-ProcResult 'WebAgent (MSI)' $p @(0, 3010)
         } elseif ($waZip) {
             Write-Log 'INFO' "WebAgent ZIP: $($waZip.Name) - extracting..."
@@ -889,16 +843,14 @@ if ($InstallWebAgent) {
             $msiInZip = Get-ChildItem -Path $extractDir -Filter '*.msi' -Recurse | Select-Object -First 1
             if ($msiInZip) {
                 $p = Start-Process -FilePath 'msiexec.exe' `
-                     -ArgumentList '/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart' -PassThru
-                Wait-ProcPumping $p
+                     -ArgumentList '/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
                 Write-ProcResult 'WebAgent (ZIP)' $p @(0, 3010)
             } else {
                 Write-Log 'WARN' "No MSI found inside the ZIP"
             }
         } elseif ($waExe) {
             Write-Log 'INFO' "WebAgent EXE (legacy): $($waExe.Name)"
-            $p = Start-Process -FilePath $waExe.FullName -ArgumentList '/S' -PassThru
-            Wait-ProcPumping $p
+            $p = Start-Process -FilePath $waExe.FullName -ArgumentList '/S' -Wait -PassThru
             Write-ProcResult 'WebAgent (EXE)' $p
         } else {
             Write-Log 'WARN' "WebAgent installer not found in $PathWebAgent"
@@ -931,42 +883,33 @@ Log: $LogFile
 
 Add-Content -Path $LogFile -Value $checklist -Encoding UTF8 -ErrorAction SilentlyContinue
 
-# Show the checklist in the live window (replaces the modal checklist popup), appended
-# directly to the RichTextBox so it is NOT duplicated in the log file (Add-Content already
-# wrote it once above). Then flip the window to its "done, you may close" state.
-if ($script:UI) {
-    try {
-        $rtb = $script:UI.Log
-        $rtb.SelectionStart = $rtb.TextLength
-        $rtb.SelectionColor = $script:LevelClr.INFO
-        $rtb.AppendText($checklist + "`n")
-        $rtb.SelectionColor = $rtb.ForeColor
-        $rtb.ScrollToCaret()
-        [System.Windows.Forms.Application]::DoEvents()
-    } catch { }
+# Show the checklist in the progress window (enqueue each line; the file already has it once).
+if ($script:LogQueue) {
+    foreach ($cl in ($checklist -split "`n")) {
+        $script:LogQueue.Enqueue([pscustomobject]@{ Level = 'INFO'; Line = $cl })
+    }
 }
-Complete-ProgressUI
 
 if ($script:Erros.Count -gt 0) {
     $s = if ($script:Erros.Count -ne 1) { 's' } else { '' }
-    $errSummary = "ATTENTION: $($script:Erros.Count) error$s during setup:`n`n" +
-                  ($script:Erros -join "`n") +
-                  "`n`nFull log: $LogFile"
     Write-Log 'INFO' "Setup completed with $($script:Erros.Count) error$s"
-    # Modal error summary forces acknowledgement (interactive only).
-    if ($script:UI) {
-        [System.Windows.Forms.MessageBox]::Show(
-            $errSummary,
-            'Setup - Errors Found',
-            'OK',
-            'Warning'
-        ) | Out-Null
-    }
-    Wait-WindowClosed
-    # Signals failure to the caller (run.bat / FirstLogonCommands check %errorlevel%).
-    exit 1
+    if ($script:UiState) { $script:UiState.Status = "Done - $($script:Erros.Count) error$s. Review the red lines above, then close." }
+    $exitCode = 1
 } else {
     Write-Log 'OK' "setup.ps1 completed without errors"
-    Wait-WindowClosed
-    exit 0
+    if ($script:UiState) { $script:UiState.Status = 'Done - no errors. You may close this window.' }
+    $exitCode = 0
 }
+
+# Hand the progress window to the technician: mark Done (the Timer enables Close and fills the
+# bar), then block until they close it (Application.Run returns) so we don't kill the window on
+# exit. If the window was closed early, EndInvoke returns at once and the work still completed.
+if ($script:ProgUI) {
+    $script:UiState.Done = $true
+    try { $script:ProgUI.PS.EndInvoke($script:ProgUI.Handle) } catch { }
+    try { $script:ProgUI.PS.Dispose() } catch { }
+    try { $script:ProgUI.Runspace.Dispose() } catch { }
+}
+
+# Signals failure to the caller (run.bat / FirstLogonCommands check %errorlevel%).
+exit $exitCode
