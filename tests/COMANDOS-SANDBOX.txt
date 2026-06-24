@@ -1,0 +1,93 @@
+========================================
+ COMANDOS DO TESTE NO SANDBOX
+========================================
+
+Fluxo: PASSO 0 (no Windows) abre o Sandbox. Dentro dele, o bootstrap.ps1
+RODA SOZINHO no login: pre-cria setupadmin -> roda setup.ps1 -Unattended
+(headless, sem GUI) -> imprime no final  RESULTADO: PASSOU / FALHOU.
+Os PASSOS 1-3 so sao necessarios pra RE-RODAR a mao dentro do Sandbox.
+
+
+========================================
+ PASSO 0 — NO WINDOWS (HOST): abrir o Sandbox
+========================================
+
+Pre-requisito (1x): Windows Sandbox ligado
+  Ativar recursos do Windows -> Windows Sandbox -> reiniciar
+
+Abrir PowerShell COMO ADMINISTRADOR (cria C:\SandboxTest na raiz do C:):
+  Win+X -> "Terminal (Admin)" ou "PowerShell (Admin)"
+
+Rodar o prep (copia tudo, gera o .wsb e abre o Sandbox):
+
+powershell -ExecutionPolicy Bypass -File "\\wsl.localhost\Ubuntu\home\<seu-usuario>\githubProjects\windows-automatization\tests\prep.ps1"
+
+-> O Sandbox abre e o bootstrap.ps1 roda sozinho. Leia o RESULTADO no fim.
+
+
+========================================
+ DENTRO DO SANDBOX (re-rodar a mao)
+========================================
+
+Abrir PowerShell: Win+R -> powershell -> Enter
+
+
+----------------------------------------
+ PASSO 1 — Re-rodar o teste manualmente
+----------------------------------------
+
+powershell -ExecutionPolicy Bypass -File C:\Tests\bootstrap.ps1
+
+
+----------------------------------------
+ PASSO 2 — Se der erro de encoding
+         (caracteres tipo â€")
+----------------------------------------
+
+$f = "C:\USB\setup.ps1"; $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8); [System.IO.File]::WriteAllText($f, $raw, (New-Object System.Text.UTF8Encoding $true)); powershell -ExecutionPolicy Bypass -File $f -Unattended -TestFullName 'Fulano de Teste' -TestUsername 'fulano.teste'
+
+
+----------------------------------------
+ PASSO 3 — Veredito e log
+----------------------------------------
+
+# O veredito (PASSOU/FALHOU) ja aparece no fim do bootstrap.
+# Para conferir o log inteiro:
+notepad C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt
+
+# Contar erros reais a mao (so [ERROR]/[FATAL] reprovam; [WARN] e' esperado):
+Get-Content C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt | Select-String -Pattern '\[(ERROR|FATAL)\]'
+
+
+----------------------------------------
+ VERIFICACOES MANUAIS (apos o teste)
+----------------------------------------
+
+# Usuario de teste foi criado? (fulano.teste)
+Get-LocalUser | Where-Object Enabled
+
+# Assinatura foi criada? (fulano.teste.htm)
+Get-Item "$env:APPDATA\Microsoft\Signatures\*"
+
+# setupadmin existe e teve a senha trocada pelo setup?
+Get-LocalUser -Name setupadmin
+
+
+----------------------------------------
+ ESPERADO NUM TESTE QUE PASSA
+----------------------------------------
+
+- RESULTADO: PASSOU (exit 0, 0 erros)
+- WARN (normais, NAO reprovam): WiFi (sem adaptador), share (path fake),
+  Ninite/Office/Belarc/Epson (binarios ausentes no sandbox)
+- Se aparecer [ERROR] ou [FATAL] -> investigar a linha vermelha
+
+
+----------------------------------------
+ NOTAS
+----------------------------------------
+
+- Fechar o Sandbox apaga TUDO (resetado)
+- Para novo teste: fechar, abrir sandbox.wsb de novo
+- Sandbox fica em: C:\SandboxTest\sandbox.wsb
+- Para abrir:  Start-Process C:\SandboxTest\sandbox.wsb

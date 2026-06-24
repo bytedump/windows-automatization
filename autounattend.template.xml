@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <!-- ============================================================ -->
+  <!-- windowsPE: Locale + bypass TPM/SecureBoot + particionamento  -->
+  <!-- ============================================================ -->
+  <settings pass="windowsPE">
+
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>pt-BR</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+    <!-- Bypass TPM/SecureBoot/RAM para PCs sem TPM 2.0 (Dell antigos).
+         Apenas estas 3 chaves LabConfig existem de fato; BypassCPUCheck/BypassStorageCheck
+         sao no-op (ignoradas pelo setup) e por isso nao estao aqui. -->
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <!-- Chave genérica Win 11 Pro — seleciona edição Pro, não ativa -->
+      <!-- Ativação via chave OEM do firmware UEFI (automática no Dell) -->
+      <UserData>
+        <ProductKey>
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+
+      <!-- GUARD DE DISCO: roda ANTES do DiskConfiguration (o wipe). A letra da USB nao
+           e' fixa no WinPE, entao varre as unidades procurando guard-disk.cmd e o executa.
+           Se houver >1 disco fixo, o .cmd desliga a maquina (wpeutil shutdown) antes do wipe.
+           Setup\RunSynchronous e' o unico RunSynchronous valido no windowsPE.
+           ====================================================================
+           ATENCAO: a ordem RunSynchronous-vs-wipe NAO e' cravada pela Microsoft
+           (confianca media). TESTAR em VM com 2 discos ANTES de confiar em producao.
+           Se o install se comportar mal, este bloco e' o 1o a reverter. Em maquina de
+           1 disco e' inofensivo (o guard-disk.cmd so loga e segue). -->
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c "for %i in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %i:\guard-disk.cmd call %i:\guard-disk.cmd"</Path>
+          <Description>Guard: aborta a instalacao se houver mais de 1 disco fixo</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+
+      <!-- GPT/UEFI: EFI (300MB) + MSR (16MB) + Windows (restante) -->
+      <!-- WillShowUI=OnError: pausa e mostra UI se o particionamento FALHAR.
+           NAO protege contra apagar o disco errado num cenario multi-disco (apagar
+           o Disk 0 errado nao gera "erro"). Premissa: a maquina-alvo tem 1 disco so.
+           A trava de ">1 disco" e' o RunSynchronous acima (guard-disk.cmd). -->
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Size>300</Size>
+              <Type>EFI</Type>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Size>16</Size>
+              <Type>MSR</Type>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Extend>true</Extend>
+              <Type>Primary</Type>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>FAT32</Format>
+              <Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+
+    </component>
+  </settings>
+
+  <!-- ============================================================ -->
+  <!-- specialize: Locale + nome aleatório + BypassNRO              -->
+  <!-- ============================================================ -->
+  <settings pass="specialize">
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+    </component>
+
+    <!-- Evita a tela "conecte a rede" no OOBE. Valido ate ~24H2 (build 26100);
+         a MS removeu o BypassNRO em builds Insider posteriores (26200+). Aqui e'
+         redundante: o oobeSystem ja pula o OOBE inteiro (SkipMachine/UserOOBE +
+         HideOnlineAccountScreens), entao a tela de rede nunca e' alcancada. -->
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+
+  </settings>
+
+  <!-- ============================================================ -->
+  <!-- oobeSystem: Skip OOBE, criar conta __ADMIN_USER__, autologon       -->
+  <!-- ============================================================ -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>__ADMIN_USER__</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <!-- O <Value> abaixo e' preenchido pelo build-usb.ps1 ao montar a USB
+                   (base64 de UTF-16 de SENHA + sufixo "Password", como o Windows espera). -->
+              <Value>__ADMIN_PW_B64__</Value>
+              <PlainText>false</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>__ADMIN_USER__</Username>
+        <Password>
+          <Value>__ADMIN_PW_B64__</Value>
+          <PlainText>false</PlainText>
+        </Password>
+        <!-- LogonCount=1: o autologon vale por 1 boot. OK porque o setup.ps1
+             NAO reinicia a maquina no meio (reboot e' item manual do checklist).
+             Se algum dia o setup passar a reiniciar, subir este numero. -->
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <!-- Lanca o setup.ps1 do pendrive no primeiro logon (hands-free real).
+           A letra do USB nao e' deterministica, entao varre as unidades procurando
+           o drive que tem setup.ps1 E config.ps1 juntos (o payload real — evita pegar
+           um setup.ps1 solto em outro drive). No 1o logon o USB pode ainda nao ter
+           recebido letra, entao tenta por ~60s (30x2s). Se nao achar, avisa com
+           MessageBox (em vez de falhar calado). Roda em modo GUI (SEM -Unattended). -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1') -Wait } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Pendrive de setup nao encontrado (precisa setup.ps1 + config.ps1 na raiz). Reconecte o pendrive e rode run.bat manualmente.','Setup','OK','Error') | Out-Null }"</CommandLine>
+          <Description>Pos-provisionamento: abre o setup.ps1 (GUI) do pendrive</Description>
+          <RequiresUserInput>true</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <TimeZone>E. South America Standard Time</TimeZone>
+
+    </component>
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+  </settings>
+
+</unattend>

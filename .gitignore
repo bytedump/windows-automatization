@@ -1,0 +1,58 @@
+# Credenciais e config local — NUNCA commitar
+config.ps1
+
+# Impressoras reais (IPs/setores internos) — usar printers.example.json como base
+printers.json
+
+# autounattend.xml real (gerado pelo build-usb.ps1 com a senha bootstrap) — so o
+# autounattend.template.xml vai no repo. NUNCA commitar o gerado.
+autounattend.xml
+
+# Arquivos de instalação e binários (grandes, ficam no pendrive/rede)
+*.msi
+*.MSI
+*.exe
+*.EXE
+*.zip
+*.ZIP
+*.rar
+*.RAR
+*.dll
+*.DLL
+*.dmg
+*.DMG
+
+# Imagens (wallpapers, drivers)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# VPN — configs sensíveis
+*.ovpn
+
+# Documentos/planilhas
+*.xlsx
+*.xls
+*.pdf
+
+# Lixo macOS
+.DS_Store
+._*
+
+# Logs gerados durante setup
+*.log
+
+# Texto operacional (não é código)
+Tend e TOTVS.txt
+
+# Pasta de automação (binários + scripts operacionais, ficam no pendrive)
+automatizacaoCloud/
+
+# Assinaturas — dados pessoais de funcionários, operacional (só a da raiz do USB;
+# a fixture de teste em tests/usb-sim/assinatura-2026/ é versionada de propósito)
+/assinatura-2026/
+
+# Lixo Windows/macOS
+*.lnk
+*Zone.Identifier

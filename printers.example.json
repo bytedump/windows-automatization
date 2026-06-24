@@ -1,0 +1,12 @@
+[
+  {
+    "name": "Impressora RH",
+    "model": "EPSON L3250",
+    "ip": "192.168.1.100"
+  },
+  {
+    "name": "Impressora Contabilidade",
+    "model": "EPSON L5190",
+    "ip": "192.168.1.101"
+  }
+]
