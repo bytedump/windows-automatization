@@ -21,6 +21,7 @@ repo ships **templates**; you fill them in once when you build the master USB.
 - [4. How to test](#4-how-to-test)
 - [Troubleshooting](#troubleshooting)
 - [5. Repository files](#5-repository-files)
+- [Roadmap — intranet auto-provisioning](#roadmap--intranet-auto-provisioning-planned)
 
 ## Overview
 
@@ -517,3 +518,32 @@ DISM /Unmount-Wim /MountDir:C:\mnt /Commit
 - `wallpaper.jpg` — corporate wallpaper
 - `assinatura-2026/` — Outlook signature `.htm` files (employee personal data)
 - `Drivers Epson/`, `20.WebAgent/`, `belarc.exe`, `OfficeSetup.exe` — installers
+
+---
+
+## Roadmap — intranet auto-provisioning (planned)
+
+Today the technician re-types the same machine/user data into two internal IT web
+portals **after** `setup.ps1` finishes. The planned next step is to have `setup.ps1`
+**POST the data it already collected** to those portals so their forms auto-fill —
+removing the double entry and the typos it causes.
+
+- **User-gateway portal** (SSO user panel) — receives full name, email, username,
+  department/role, organization and a default permission profile; it then propagates
+  the user to the ticketing/Kanban systems on the next SSO login.
+- **IT asset portal** (device registration) — receives device type, responsible
+  employee, department/organization, IP, MAC, hostname/asset tag and remote-access
+  info (extension, AnyDesk ID).
+
+Principles for the integration:
+
+- **Best-effort, never blocking.** A portal being down logs a `WARN`; provisioning
+  still completes. Same contract as every other phase.
+- **No secrets in code.** Portal base URLs and API credentials live in `config.ps1`
+  (gitignored); never hardcoded. Prefer HTTPS / internal-only reachability.
+- **Idempotent.** Look the record up before creating it, so a re-run does not
+  duplicate the user/device.
+
+> Detailed endpoint/field mapping, auth flow and PowerShell sketches are kept in an
+> **internal** document (`resumo-windows-auto.md`), intentionally **outside this public
+> repository** because it references internal hostnames and architecture.

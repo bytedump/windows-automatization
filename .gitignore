@@ -1,6 +1,9 @@
 # Credenciais e config local — NUNCA commitar
 config.ps1
 
+# Resumo técnico interno (IPs/arquitetura/Yellow Hub/SIGA-TI) — repo é PÚBLICO, NUNCA commitar
+resumo-windows-auto.md
+
 # Impressoras reais (IPs/setores internos) — usar printers.example.json como base
 printers.json
 
