@@ -295,8 +295,8 @@ Phase 1 — Load config.ps1; apply OEM license (slmgr); rotate the bootstrap adm
     ↓
 Phase 2 — WiFi (WPA2PSK), map the corporate share, load printers.json
     ↓
-Phase 3 — GUI (single window): the input form (full name, username, email domain, network
-          DHCP/Static IP, printer, sector, signature .htm, WebAgent) on top, plus a live
+Phase 3 — GUI (single window): the input form (first + last name, username, email domain,
+          network DHCP/Static IP, printer, sector, signature .htm, WebAgent) on top, plus a live
           progress section at the bottom that streams every task below as it runs
     ↓
 Phase 4 — Rename PC to BIOS SerialNumber; create local user; configure Ethernet; wallpaper
@@ -323,8 +323,9 @@ once: Ninite (uses msiexec internally) and WebAgent (MSI) never overlap, while O
 | New (username) | Standard User | Day-to-day account |
 
 - The username is the Windows login **and** the email prefix: enforced as lowercase
-  `name.surname` (letters + a single dot, no digits/spaces/accents). The **full name** is a
-  separate field — Title-Cased and used as the account display name and in the signature.
+  `name.surname` (letters + a single dot, no digits/spaces/accents). The display name is entered
+  as separate **First** and **Last** name fields (Tab between them), concatenated and Title-Cased
+  into the read-only "Full name" shown below — used as the account display name and in the signature.
 - Initial password: `$UserInitialPass`; never expires; never written to the log.
 
 ### Network configuration
