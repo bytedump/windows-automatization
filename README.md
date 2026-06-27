@@ -120,14 +120,21 @@ the USB drive at build time and are all gitignored.
 
 | Item | Where it lives |
 |---|---|
-| Bootstrap admin password | Only in the **generated** `autounattend.xml` (gitignored), created by `build-usb.ps1`. Replaced on first login by `setup.ps1`. |
+| Bootstrap admin password | Only in the **generated** `autounattend.xml` (gitignored), created by `build-usb.ps1`. Replaced on first login by `setup.ps1`, which then **deletes** `autounattend.xml` from the USB and the `Panther\unattend.xml` copy. |
 | Real admin / user passwords | Only in `config.ps1` (gitignored) — `$AdminNewPass`, `$UserInitialPass` |
 | Share / WiFi credentials | Only in `config.ps1` (gitignored) |
 | Printer IPs / sectors | Only in `printers.json` (gitignored) — internal network data |
 | Outlook signatures | Only in `assinatura-2026/` (gitignored) — employee personal data |
-| WiFi profile | SSID and password XML-escaped via `SecurityElement.Escape` — safe for `&`, `<`, `>` |
+| WiFi profile | SSID and password XML-escaped via `SecurityElement.Escape`; the temp profile XML (plaintext PSK) is **deleted** right after `netsh` imports it |
 | Share connection | `New-SmbMapping` — password never exposed on the command line or Event 4688 |
 | Setup log | Credentials never written to `win11_setup_log.txt` |
+
+> **Physical security of the USB.** Until `setup.ps1` finishes its first run, the USB carries
+> live credentials in cleartext: the real passwords in `config.ps1` and the bootstrap password
+> in `autounattend.xml` (Windows-reversible base64). Treat the prepared USB as a secret — keep it
+> in locked storage, do not leave it in public machines, and ideally keep it on an encrypted
+> volume. `setup.ps1` scrubs `autounattend.xml` after rotating the password, but `config.ps1`
+> stays on the USB by design (so the operator can re-run setup).
 
 ### Why a bootstrap password at all
 
@@ -164,6 +171,11 @@ opens automatically via `FirstLogonCommands`.
 | Local admin account | `$AdminAccount` (bootstrap password — replaced by `setup.ps1`) |
 | AutoLogon | Enabled — once on first boot (`LogonCount=1`) |
 | Auto-launch | `FirstLogonCommands` finds the USB (drive with `setup.ps1` **and** `config.ps1`), retries ~60s, opens `setup.ps1` (GUI) |
+
+> **Region/locale is hardcoded to pt-BR** (language, ABNT2 keyboard, Brasília time zone). The
+> tool targets Brazilian deployments; using it elsewhere installs a pt-BR system. To retarget,
+> change `InputLocale`/`SystemLocale`/`UILanguage`/`UserLocale` (all three passes) and `TimeZone`
+> in `autounattend.template.xml`.
 
 ### Skipped screens (OOBE)
 
@@ -202,21 +214,29 @@ Automatic bypass via `LabConfig` keys in the `windowsPE` pass. Only these three 
 | `BypassSecureBootCheck` | Skips Secure Boot |
 | `BypassRAMCheck` | Skips RAM check |
 
-### Disk guard (">1 disk → abort")
+### Disk guard (fail-closed: exactly 1 disk)
 
 `guard-disk.cmd` counts fixed disks in WinPE (via `diskpart`, since PowerShell/WMIC are
-absent from the default Setup boot image) and runs `wpeutil shutdown` if more than one is
-found — preventing a wrong-disk wipe on a multi-disk machine.
+absent from the default Setup boot image) and is **fail-closed**: it lets the install proceed
+**only** when it confirms *exactly one* fixed disk. On any other outcome — `0` disks parsed
+(diskpart/locale failure), more than one disk, or a diskpart error — it runs `wpeutil shutdown`
+**before** anything is wiped. Disk counting covers EN/pt/es/it/fr/de WinPE languages.
 
-It is wired into `autounattend.xml` as a `RunSynchronous` command in the
-`Microsoft-Windows-Setup` component, **before** `DiskConfiguration`. The WinPE drive letter
-is not fixed, so the command scans drives for `guard-disk.cmd`.
+It is wired into `autounattend.xml` as two `RunSynchronous` commands in the
+`Microsoft-Windows-Setup` component, **before** `DiskConfiguration`:
+
+1. **Order 1** — the WinPE drive letter is not fixed, so it scans drives for `guard-disk.cmd`
+   and calls it. On the "exactly 1" success path the script writes a marker
+   (`%TEMP%\guard_ok.flag`).
+2. **Order 2** — `if not exist %TEMP%\guard_ok.flag wpeutil shutdown`. This catches the case
+   where `guard-disk.cmd` is **missing from the media** (so Order 1 never ran): no marker → the
+   install still fails closed instead of wiping blind.
 
 > ⚠️ The ordering of `RunSynchronous` versus the disk wipe is **not contractually
 > guaranteed** by Microsoft (medium confidence). **Test in a VM with two disks before
-> relying on it.** On a single-disk machine it is harmless (the script just logs and
-> continues). The fully-guaranteed alternative is to move partitioning into a `diskpart`
-> script called from `RunSynchronous`.
+> relying on it.** To disable the guard, delete both `RunSynchronousCommand` blocks. The
+> fully-guaranteed alternative is to move partitioning into a `diskpart` script called from
+> `RunSynchronous`.
 
 ---
 
