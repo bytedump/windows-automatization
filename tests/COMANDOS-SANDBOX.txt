@@ -5,8 +5,9 @@
 Flow: STEP 0 (on Windows) opens the Sandbox. Inside it, bootstrap.ps1 RUNS BY
 ITSELF at login: pre-creates setupadmin -> runs setup.ps1 INTERACTIVELY (the GUI,
 production-like) -> at the end prints  RESULT: PASSED / FAILED.
-Fill the GUI with the test fixtures: domain empresa.com.br, sector TI, printer
-'Test Printer'. For the headless automated assertion (no GUI), use -Headless.
+Fill the GUI: First 'Test', Last 'User' (the Username auto-fills to test.user -
+you do NOT type it), domain empresa.com.br, sector TI, printer 'Test Printer'.
+For the headless automated assertion (no GUI), use -Headless.
 STEPS 1-3 are only needed to RE-RUN it by hand inside the Sandbox.
 
 
@@ -122,7 +123,7 @@ Get-Content C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt | Select-Str
  MANUAL CHECKS (after the test)
 ----------------------------------------
 
-# Was the test user created? (test.user)
+# Was the test user created? (test.user - it should have been auto-derived from First 'Test' + Last 'User')
 Get-LocalUser | Where-Object Enabled
 
 # Was the signature created? (test.user.htm)

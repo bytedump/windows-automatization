@@ -88,8 +88,8 @@ if ($Headless) {
         -Unattended -TestFullName 'Test User' -TestUsername 'test.user'
 } else {
     # Production-like: the GUI appears. Fill it with the test fixtures and click Start:
-    #   email domain = empresa.com.br | sector = TI | printer = Test Printer
-    Write-Host "  Fill the GUI (domain empresa.com.br, sector TI, printer 'Test Printer') and click Start." -ForegroundColor DarkGray
+    #   First = Test | Last = User (Username auto-fills to test.user) | domain = empresa.com.br | sector = TI | printer = Test Printer
+    Write-Host "  Fill the GUI (First 'Test', Last 'User' -> Username auto 'test.user'; domain empresa.com.br, sector TI, printer 'Test Printer') and click Start." -ForegroundColor DarkGray
     Write-Host ""
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setupFile
 }
