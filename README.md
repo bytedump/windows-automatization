@@ -253,8 +253,9 @@ used by the Sandbox harness (no window).
 
 ### Error handling
 - **Input is validated and normalized before any action.** The form sanitizes as you type
-  (full name accepts letters/spaces/hyphen/apostrophe only; username forced to lowercase
-  `name.surname` with accents stripped; the static IP field masks to four `0-255` octets,
+  (full name accepts letters/spaces/hyphen/apostrophe only; the username is auto-derived from
+  First + Last as lowercase `name.surname` with accents stripped, and stays editable for overrides;
+  the static IP field masks to four `0-255` octets,
   with Enter to jump between octets) and **blocks submit** with one consolidated, plain-language
   message + per-field markers if anything is still invalid. The same validators re-run at the single point where
   the GUI and headless `-Test*` paths converge, so automation can't drive the script into a
@@ -316,7 +317,7 @@ Phase 1 — Load config.ps1; apply OEM license (slmgr); rotate the bootstrap adm
     ↓
 Phase 2 — WiFi (WPA2PSK), map the corporate share, load printers.json
     ↓
-Phase 3 — GUI (single window): the input form (first + last name, username, email domain,
+Phase 3 — GUI (single window): the input form (first + last name -> auto username, email domain,
           network DHCP/Static IP, printer, sector, signature .htm, WebAgent) on top, plus a live
           progress section at the bottom that streams every task below as it runs
     ↓
@@ -343,10 +344,13 @@ once: Ninite (uses msiexec internally) and WebAgent (MSI) never overlap, while O
 | `$AdminAccount` (e.g. `setupadmin`) | Administrator | Technical setup account |
 | New (username) | Standard User | Day-to-day account |
 
-- The username is the Windows login **and** the email prefix: enforced as lowercase
-  `name.surname` (letters + a single dot, no digits/spaces/accents). The display name is entered
-  as separate **First** and **Last** name fields (Tab between them), concatenated and Title-Cased
-  into the read-only "Full name" shown below — used as the account display name and in the signature.
+- The display name is entered as separate **First** and **Last** name fields (Tab between them),
+  concatenated and Title-Cased into the read-only "Full name" — used as the account display name
+  and in the signature.
+- The username is **auto-derived** from those fields as lowercase `firstname.surname` (accents
+  stripped, letters + a single dot; `João Silva` → `joao.silva`) so the technician doesn't type
+  it. It stays editable for overrides (e.g. duplicate names) and is the Windows login **and** the
+  email prefix; the same `name.surname` shape is enforced at submit.
 - Initial password: `$UserInitialPass`; never expires; never written to the log.
 
 ### Network configuration
@@ -421,7 +425,7 @@ manual checklist item.
 6.  [AUTO] AutoLogon as the bootstrap admin (one time)
 7.  [AUTO] setup.ps1 opens automatically (FirstLogonCommands) — run.bat is the manual fallback
 8.  [AUTO] OEM license applied + bootstrap admin password rotated
-9.  [INTERACTIVE] GUI (single window) — technician fills name/username/domain/network/printer/sector; the bottom section then streams steps 10-12 live
+9.  [INTERACTIVE] GUI (single window) — technician fills name/domain/network/printer/sector (username auto-derived from the name); the bottom section then streams steps 10-12 live
 10. [AUTO] PC renamed, user created, network + wallpaper configured
 11. [AUTO] Ninite + Office + Belarc + Epson installed in parallel; WebAgent after
 12. [AUTO] Outlook signature created; checklist shown + saved to Desktop

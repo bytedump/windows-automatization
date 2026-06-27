@@ -67,6 +67,17 @@ function Test-Ipv4 {
     return $true
 }
 
+# Derive the Windows login / e-mail prefix from first + last name: firstname.surname,
+# accent-stripped, lowercase, letters only. 'Joao Pedro' + 'da Silva' -> 'joao.silva'.
+# Returns '' until both names have a usable token (the form keeps the field empty meanwhile).
+function Format-Username {
+    param([string]$First, [string]$Last)
+    $ft = @(((Remove-Diacritics $First) -replace '[^A-Za-z ]', '') -split '\s+' | Where-Object { $_ })
+    $lt = @(((Remove-Diacritics $Last)  -replace '[^A-Za-z ]', '') -split '\s+' | Where-Object { $_ })
+    if ($ft.Count -eq 0 -or $lt.Count -eq 0) { return '' }
+    return ($ft[0] + '.' + $lt[-1]).ToLower()
+}
+
 # ============================================================
 # setup.ps1 - Windows 11 Setup
 # Run automatically by autounattend.xml on the first login
@@ -653,6 +664,9 @@ $py = $py + 20 + 25 + 12
 # Inputs keep raw casing; the read-only output above is the source of truth (Title Case). The
 # concat is always "First Last" (never flipped). Shared SuppressName guard is safe: each handler
 # only sets its OWN box, and $TxtFullName has no TextChanged so the concat write cannot recurse.
+# Username is auto-derived from First+Last (firstname.surname) so the technician never types it;
+# it stays editable - once they type in the Username box (KeyDown below), auto-fill backs off.
+$script:UserEditedUsername = $false
 $TxtFirstName.Add_TextChanged({
     if ($script:SuppressName) { return }
     $raw   = $TxtFirstName.Text
@@ -665,6 +679,7 @@ $TxtFirstName.Add_TextChanged({
         $TxtFirstName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
     }
     $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
+    if (-not $script:UserEditedUsername) { $TxtUsername.Text = Format-Username $TxtFirstName.Text $TxtLastName.Text }
 })
 $TxtLastName.Add_TextChanged({
     if ($script:SuppressName) { return }
@@ -678,10 +693,15 @@ $TxtLastName.Add_TextChanged({
         $TxtLastName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
     }
     $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
+    if (-not $script:UserEditedUsername) { $TxtUsername.Text = Format-Username $TxtFirstName.Text $TxtLastName.Text }
 })
 $TxtUsername = New-TextBox
-$Tip.SetToolTip($TxtUsername, 'Windows login and email prefix. Use lowercase, e.g. joao.silva')
-$py = Add-Field $gUser 'Username (e.g. joao.silva)' $TxtUsername 16 $py $true
+$Tip.SetToolTip($TxtUsername, 'Auto-filled from First + Last (e.g. joao.silva). Edit only if you need a different login.')
+$py = Add-Field $gUser 'Username (auto from name)' $TxtUsername 16 $py $true
+# A real keystroke here means the technician is overriding the auto-derived value: stop syncing
+# it from the name fields. KeyDown fires only on physical input, not on our programmatic .Text
+# assignment, so the auto-fill itself never trips this.
+$TxtUsername.Add_KeyDown({ $script:UserEditedUsername = $true })
 # Live cleanup: strip accents (o-acute -> o, c-cedilla -> c) BEFORE filtering so the letter
 # survives, force lowercase, keep only [a-z.], collapse repeated dots. Caret-preserving.
 # Registered BEFORE the email-preview handler (below) so the preview sees the cleaned text.
