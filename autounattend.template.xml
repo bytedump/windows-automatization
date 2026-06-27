@@ -61,20 +61,26 @@
         <AcceptEula>true</AcceptEula>
       </UserData>
 
-      <!-- DISK GUARD: runs BEFORE DiskConfiguration (the wipe). The USB drive letter is
-           not fixed in WinPE, so it scans the drives looking for guard-disk.cmd and runs it.
-           If there is >1 fixed disk, the .cmd shuts the machine down (wpeutil shutdown) before the wipe.
-           Setup\RunSynchronous is the only valid RunSynchronous in windowsPE.
+      <!-- DISK GUARD (FAIL-CLOSED): runs BEFORE DiskConfiguration (the wipe). The USB drive letter
+           is not fixed in WinPE, so Order 1 scans the drives and calls guard-disk.cmd, which shuts
+           the machine down UNLESS it confirms EXACTLY 1 fixed disk - and on success writes the
+           marker %TEMP%\guard_ok.flag. Order 2 shuts down if that marker is absent, so even if
+           guard-disk.cmd is missing from the media (never called) the install fails CLOSED instead
+           of wiping blind. Setup\RunSynchronous is the only valid RunSynchronous in windowsPE.
            ====================================================================
            WARNING: the RunSynchronous-vs-wipe ordering is NOT pinned down by Microsoft
            (medium confidence). TEST in a VM with 2 disks BEFORE relying on it in production.
-           If the install misbehaves, this block is the first to revert. On a single-disk
-           machine it is harmless (guard-disk.cmd just logs and continues). -->
+           To disable the guard, delete both RunSynchronousCommand blocks below. -->
       <RunSynchronous>
         <RunSynchronousCommand wcm:action="add">
           <Order>1</Order>
           <Path>cmd /c "for %i in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %i:\guard-disk.cmd call %i:\guard-disk.cmd"</Path>
-          <Description>Guard: abort the installation if there is more than 1 fixed disk</Description>
+          <Description>Guard: run guard-disk.cmd (aborts unless exactly 1 fixed disk)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c "if not exist %TEMP%\guard_ok.flag wpeutil shutdown"</Path>
+          <Description>Guard: fail closed if guard-disk.cmd did not confirm a single disk</Description>
         </RunSynchronousCommand>
       </RunSynchronous>
 
