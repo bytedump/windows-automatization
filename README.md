@@ -19,22 +19,22 @@ repo ships **templates**; you fill them in once when you build the master USB.
 > _PowerShell setup GUI — screenshot coming soon._
 <!-- ![Setup GUI](docs/setup-gui.png) -->
 
-## Table of Contents
+## 📑 Table of Contents
 
-- [Overview](#overview)
-- [Preparing the master USB](#preparing-the-master-usb)
-- [USB drive layout](#usb-drive-layout)
-- [Security model](#security-model)
-- [1. autounattend.xml](#1-autounattendxml)
-- [2. setup.ps1](#2-setupps1)
-- [3. Full flow](#3-full-flow)
-- [4. How to test](#4-how-to-test)
-- [Troubleshooting](#troubleshooting)
-- [5. Repository files](#5-repository-files)
-- [Roadmap — intranet auto-provisioning](#roadmap--intranet-auto-provisioning-planned)
+- [Overview](#-overview)
+- [Preparing the master USB](#-preparing-the-master-usb)
+- [USB drive layout](#-usb-drive-layout)
+- [Security model](#-security-model)
+- [1. autounattend.xml](#-1-autounattendxml)
+- [2. setup.ps1](#-2-setupps1)
+- [3. Full flow](#-3-full-flow)
+- [4. How to test](#-4-how-to-test)
+- [Troubleshooting](#-troubleshooting)
+- [5. Repository files](#-5-repository-files)
+- [Roadmap — intranet auto-provisioning](#-roadmap--intranet-auto-provisioning-planned)
 - [License](#-license)
 
-## Overview
+## 📋 Overview
 
 - 100% hands-free installation (zero clicks until the desktop)
 - Secrets kept **out of the repository** — templates in git, real values on the USB drive
@@ -44,7 +44,7 @@ repo ships **templates**; you fill them in once when you build the master USB.
 
 ---
 
-## Preparing the master USB
+## 🛠️ Preparing the master USB
 
 Done **once** per master USB. The per-machine boot afterwards is fully hands-free.
 
@@ -86,7 +86,7 @@ Copy the repo payload **after** Rufus finishes (the steps below write to the USB
    # then edit E:\config.ps1
    ```
 4. **Create `printers.json`** from `printers.example.json` with your real printers.
-5. **Add the binaries / assets** the installers expect (see [USB layout](#usb-drive-layout)):
+5. **Add the binaries / assets** the installers expect (see [USB layout](#-usb-drive-layout)):
    `ninite.exe`, the `Office/` ODT folder (see [Office (ODT)](#office-odt)), `belarc.exe`,
    `Drivers Epson/`, `20.WebAgent/`, the wallpaper, and the `assinatura-2026/` signature templates.
 6. Plug the USB into the target machine and boot from it — the rest is automatic.
@@ -96,7 +96,7 @@ Copy the repo payload **after** Rufus finishes (the steps below write to the USB
 
 ---
 
-## USB drive layout
+## 💾 USB drive layout
 
 ```
 USB Root/
@@ -124,7 +124,7 @@ USB Root/
 
 ---
 
-## Security model
+## 🔒 Security model
 
 No secret is committed. The repository holds templates; the real values are created on
 the USB drive at build time and are all gitignored.
@@ -160,7 +160,7 @@ rotation fails, so a machine is never silently left on the bootstrap password).
 
 ---
 
-## 1. autounattend.xml
+## 🧩 1. autounattend.xml
 
 ### What it does
 Windows Setup answer file (generated from `autounattend.template.xml`). Boot from the USB
@@ -193,7 +193,7 @@ opens automatically via `FirstLogonCommands`.
 
 | Screen | Mechanism |
 |---|---|
-| Language / Region / Keyboard | `SetupUILanguage`, `InputLocale` — **only with a matching-language ISO (pt-BR)**; on 24H2/25H2 the new "ConX" setup may still show them. See [Troubleshooting](#troubleshooting). |
+| Language / Region / Keyboard | `SetupUILanguage`, `InputLocale` — **only with a matching-language ISO (pt-BR)**; on 24H2/25H2 the new "ConX" setup may still show them. See [Troubleshooting](#-troubleshooting). |
 | Product key | Generic Pro key `VK7JG-NPHTM-C97JM-9MPGT-3V66T` (selects edition, does not activate) |
 | EULA | `<AcceptEula>true</AcceptEula>` |
 | Disk / partition | `DiskConfiguration` with `WillWipeDisk=true` |
@@ -252,7 +252,7 @@ It is wired into `autounattend.xml` as two `RunSynchronous` commands in the
 
 ---
 
-## 2. setup.ps1
+## ⚙️ 2. setup.ps1
 
 ### What it does
 PowerShell + Windows Forms GUI in a **single window**: the input form on top and a live
@@ -425,7 +425,7 @@ manual checklist item.
 
 ---
 
-## 3. Full flow
+## 🔁 3. Full flow
 
 ```
 1.  Plug the USB drive into the machine
@@ -445,7 +445,7 @@ manual checklist item.
 
 ---
 
-## 4. How to test
+## 🧪 4. How to test
 
 ### setup.ps1 — Windows Sandbox (isolated, recommended)
 
@@ -497,7 +497,7 @@ Generate the file first (`build-usb.ps1`), then:
 
 ---
 
-## Troubleshooting
+## 🩺 Troubleshooting
 
 ### Windows 11 24H2/25H2 — initial language/keyboard screens
 
@@ -537,7 +537,7 @@ DISM /Unmount-Wim /MountDir:C:\mnt /Commit
 
 ---
 
-## 5. Repository files
+## 🗂️ 5. Repository files
 
 | File | Description |
 |---|---|
@@ -564,7 +564,7 @@ DISM /Unmount-Wim /MountDir:C:\mnt /Commit
 
 ---
 
-## Roadmap — intranet auto-provisioning (planned)
+## 🚧 Roadmap — intranet auto-provisioning (planned)
 
 Today the technician re-types the same machine/user data into two internal IT web
 portals **after** `setup.ps1` finishes. The planned next step is to have `setup.ps1`
