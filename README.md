@@ -1,4 +1,9 @@
-# Automated Windows 11 Installation
+# 🖥️ Windows 11 — Automated Provisioning
+
+![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=flat&logo=powershell&logoColor=white)
+![Windows 11](https://img.shields.io/badge/Windows%2011-0078D6?style=flat&logo=windows&logoColor=white)
+![autounattend.xml](https://img.shields.io/badge/autounattend.xml-1e2327?style=flat)
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 
 Hands-free provisioning of Windows 11 machines from a USB drive: an `autounattend.xml`
 answer file installs Windows with zero clicks, then a post-install PowerShell script
@@ -8,6 +13,11 @@ and Outlook signature.
 No secrets live in this repository. Credentials and real data stay on the USB drive
 (`config.ps1`, the generated `autounattend.xml`, `printers.json`) — all gitignored. The
 repo ships **templates**; you fill them in once when you build the master USB.
+
+## 📸 Preview
+
+> _PowerShell setup GUI — screenshot coming soon._
+<!-- ![Setup GUI](docs/setup-gui.png) -->
 
 ## Table of Contents
 
@@ -22,6 +32,7 @@ repo ships **templates**; you fill them in once when you build the master USB.
 - [Troubleshooting](#troubleshooting)
 - [5. Repository files](#5-repository-files)
 - [Roadmap — intranet auto-provisioning](#roadmap--intranet-auto-provisioning-planned)
+- [License](#-license)
 
 ## Overview
 
@@ -579,3 +590,9 @@ Principles for the integration:
 > Detailed endpoint/field mapping, auth flow and PowerShell sketches are kept in an
 > **internal** document (`resumo-windows-auto.md`), intentionally **outside this public
 > repository** because it references internal hostnames and architecture.
+
+---
+
+## 📄 License
+
+Released under the [MIT License](LICENSE).
