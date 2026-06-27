@@ -62,6 +62,8 @@ if (-not $AdminPassword) { throw 'Password cannot be empty.' }
 # Windows expects the value as base64 of UTF-16LE of (password + "Password" suffix),
 # for both LocalAccount and AutoLogon. Same value in both places.
 $pwB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($AdminPassword + 'Password'))
+# Scrub the plaintext password from memory now that the base64 is built (defense-in-depth).
+$AdminPassword = $null
 
 $xml = Get-Content -Path $TemplatePath -Raw -Encoding UTF8
 $xml = $xml.Replace('__ADMIN_USER__', $AdminUser).Replace('__ADMIN_PW_B64__', $pwB64)
