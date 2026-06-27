@@ -139,6 +139,8 @@ Get-LocalUser -Name setupadmin
 - RESULT: PASSED (exit 0, 0 errors)
 - WARN (normal, do NOT fail): WiFi (no adapter), share (fake path),
   Ninite/Office/Belarc/Epson (binaries absent in the sandbox)
+- OK "Removed bootstrap credential file: ...Panther\unattend.xml" is the new
+  post-rotation scrub; a WARN "Could not remove ..." there is also benign here
 - If [ERROR] or [FATAL] appears -> investigate the red line
 
 

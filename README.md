@@ -93,7 +93,7 @@ USB Root/
   ├── setup.ps1                 ← Post-installation script (GUI)
   ├── run.bat                   ← Manual fallback to re-run setup.ps1
   ├── build.bat                 ← Double-click launcher for build-usb.ps1 (ExecutionPolicy Bypass)
-  ├── guard-disk.cmd            ← ">1 disk → abort" guard, run from autounattend in WinPE
+  ├── guard-disk.cmd            ← fail-closed disk guard (proceeds only if exactly 1 disk), run from autounattend in WinPE
   ├── config.ps1                ← Credentials and paths (copy from config.example.ps1 — gitignored)
   ├── printers.json             ← Printer list (copy from printers.example.json — gitignored)
   ├── belarc.exe                ← Belarc Advisor installer
@@ -158,7 +158,8 @@ opens automatically via `FirstLogonCommands`.
 
 > **Single-disk assumption.** `DiskConfiguration` wipes `DiskID=0` with `WillWipeDisk=true`.
 > Disk 0 is not deterministic across firmware, so wiping it is only safe on machines with a
-> **single** fixed disk. The `guard-disk.cmd` wiring (below) is the safeguard for that.
+> **single** fixed disk. The `guard-disk.cmd` wiring (below) is the fail-closed safeguard — it
+> aborts the install unless it confirms exactly one disk.
 
 ### Settings
 
@@ -414,7 +415,7 @@ manual checklist item.
 ```
 1.  Plug the USB drive into the machine
 2.  Power on → boot from USB
-3.  [AUTO] guard-disk: abort if >1 fixed disk; else disk wiped + formatted (EFI + MSR + Windows)
+3.  [AUTO] guard-disk: proceed only if exactly 1 disk (else abort); disk wiped + formatted (EFI + MSR + Windows)
 4.  [AUTO] Windows 11 Pro installed → reboot
 5.  [AUTO] Locale configured, entire OOBE skipped
 6.  [AUTO] AutoLogon as the bootstrap admin (one time)
@@ -477,7 +478,7 @@ verdict without any interaction.
 Generate the file first (`build-usb.ps1`), then:
 - **Hyper-V:** Generation 2 (UEFI) VM, Windows 11 ISO as DVD, USB with `autounattend.xml` as a second disk.
 - **VirtualBox:** new VM with the ISO, `autounattend.xml` on a virtual floppy (`.img`/`.vfd`).
-- **Disk guard:** add a second virtual disk to confirm the install aborts (`>1 disk`).
+- **Disk guard:** add a second virtual disk to confirm the install aborts (the guard proceeds only with exactly 1 disk).
 
 ---
 
@@ -531,7 +532,7 @@ DISM /Unmount-Wim /MountDir:C:\mnt /Commit
 | `force-legacy-setup.ps1` | Forces legacy Setup on the boot USB (24H2/25H2 ConX fix; run as admin, test in VM) |
 | `setup.ps1` | Post-installation script with GUI |
 | `run.bat` | Manual fallback launcher (ExecutionPolicy Bypass) |
-| `guard-disk.cmd` | WinPE guard: aborts install if >1 fixed disk (test in VM first) |
+| `guard-disk.cmd` | WinPE fail-closed guard: proceeds only if exactly 1 fixed disk (test in VM first) |
 | `config.example.ps1` | Configuration template — copy to `config.ps1` on the USB drive |
 | `printers.example.json` | Printer-list format reference — copy to `printers.json` |
 | `tests/` | Isolated test infrastructure (Windows Sandbox) |
