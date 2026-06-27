@@ -75,7 +75,7 @@ function Test-Ipv4 {
 
 $LogFile      = "$env:USERPROFILE\Desktop\win11_setup_log.txt"
 $ScriptDir    = $PSScriptRoot
-$script:Erros = [System.Collections.Generic.List[string]]::new()
+$script:Errors = [System.Collections.Generic.List[string]]::new()
 
 # Live-progress UI state. The input form is modal (ShowDialog) on the main thread; the
 # work (PHASE 4-7) runs here on the main thread, while a SEPARATE STA runspace shows a
@@ -93,7 +93,7 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
     Write-Host $line
     if ($Level -in 'ERROR', 'FATAL') {
-        $script:Erros.Add("[$Level] $Msg") | Out-Null
+        $script:Errors.Add("[$Level] $Msg") | Out-Null
     }
     # Tee to the progress window: enqueue (thread-safe). The runspace Timer drains it.
     if ($script:LogQueue) {
@@ -116,6 +116,22 @@ function Write-ProcResult {
     } else {
         Write-Log 'ERROR' "$Name failed (exit $($Proc.ExitCode))"
     }
+}
+
+# Runs an installer and waits up to $TimeoutSec, killing it on timeout. A hung silent installer
+# (e.g. msiexec /quiet blocked on a dialog) would otherwise block the whole provision forever.
+# Returns the finished process (for Write-ProcResult) or $null if it had to be killed.
+function Invoke-InstallerWithTimeout {
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutSec = 1800)
+    $params = @{ FilePath = $FilePath; PassThru = $true }
+    if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
+    $proc = Start-Process @params
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        try { $proc.Kill() } catch { }
+        Write-Log 'ERROR' "$FilePath timed out after ${TimeoutSec}s - killed"
+        return $null
+    }
+    return $proc
 }
 
 # Global trap = last-resort net for a terminating error NOT handled by try/catch.
@@ -367,6 +383,15 @@ try {
     $adminPass = ConvertTo-SecureString $AdminNewPass -AsPlainText -Force
     Set-LocalUser -Name $AdminAccount -Password $adminPass -ErrorAction Stop
     Write-Log 'OK' "$AdminAccount password updated (bootstrap removed)"
+    # The bootstrap password now lives only in autounattend.xml on the USB (Windows-reversible
+    # base64) and in Windows' own copy at Panther\unattend.xml. It has been rotated, so both are
+    # dead weight + a credential on disk: scrub them. (config.ps1 stays - run.bat may re-run setup.)
+    foreach ($u in @((Join-Path $ScriptDir 'autounattend.xml'), "$env:WINDIR\Panther\unattend.xml")) {
+        if (Test-Path $u) {
+            try { Remove-Item -LiteralPath $u -Force -ErrorAction Stop; Write-Log 'OK' "Removed bootstrap credential file: $u" }
+            catch { Write-Log 'WARN' "Could not remove ${u}: $($_.Exception.Message)" }
+        }
+    }
 } catch {
     Write-Log 'ERROR' "Rotate ${AdminAccount} password: $($_.Exception.Message)"
     # Failing here leaves the machine on the BOOTSTRAP password (the autounattend one). Treat it
@@ -409,11 +434,17 @@ if ($WifiSSID) { try {
 </WLANProfile>
 "@
     $wifiXmlPath = "$env:TEMP\corp_wifi_profile.xml"
-    Set-Content -Path $wifiXmlPath -Value $wifiXml -Encoding UTF8
-    netsh wlan add profile filename="$wifiXmlPath" 2>&1 | Out-Null
-    # add profile writes the profile synchronously; connect can be issued directly.
-    netsh wlan connect name="$WifiSSID" 2>&1 | Out-Null
-    Write-Log 'OK' "WiFi $WifiSSID configured"
+    try {
+        Set-Content -Path $wifiXmlPath -Value $wifiXml -Encoding UTF8
+        netsh wlan add profile filename="$wifiXmlPath" 2>&1 | Out-Null
+        # add profile writes the profile synchronously; connect can be issued directly.
+        netsh wlan connect name="$WifiSSID" 2>&1 | Out-Null
+        Write-Log 'OK' "WiFi $WifiSSID configured"
+    } finally {
+        # The temp profile holds the WPA2 PSK in plaintext; delete it as soon as netsh imported
+        # it (previously it was left behind, readable, in %TEMP%).
+        Remove-Item -Path $wifiXmlPath -Force -ErrorAction SilentlyContinue
+    }
 } catch {
     Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
 } } else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
@@ -431,7 +462,17 @@ $Printers = @()
 $PrintersJson = Join-Path $ScriptDir 'printers.json'
 if (Test-Path $PrintersJson) {
     try {
-        $Printers = @(Get-Content $PrintersJson -Raw -Encoding UTF8 | ConvertFrom-Json)
+        $raw = @(Get-Content $PrintersJson -Raw -Encoding UTF8 | ConvertFrom-Json)
+        # Keep only well-formed entries: the GUI and Add-Printer use name/model/ip, and under
+        # StrictMode touching a missing property is a hard error - so drop incomplete records.
+        $Printers = @($raw | Where-Object {
+            $n = $_.PSObject.Properties.Name
+            ($n -contains 'name'  -and $_.name)  -and
+            ($n -contains 'model' -and $_.model) -and
+            ($n -contains 'ip'    -and $_.ip)
+        })
+        $dropped = $raw.Count - $Printers.Count
+        if ($dropped -gt 0) { Write-Log 'WARN' "$dropped printer entry(ies) ignored (missing name/model/ip)" }
         Write-Log 'OK' "$($Printers.Count) printers loaded"
     } catch {
         Write-Log 'ERROR' "printers.json: $($_.Exception.Message)"
@@ -480,6 +521,12 @@ if (Test-Path $NinitePath) {
 # come from -Test* params and no window is shown.
 
 $useUI = (-not $Unattended) -and [System.Environment]::UserInteractive
+
+# No desktop but -Unattended not set: the form silently never shows and -Test* params drive the
+# run. Surface it so a technician who expected the GUI isn't confused by a "headless" provision.
+if (-not $useUI -and -not $Unattended) {
+    Write-Log 'WARN' 'No interactive desktop (UserInteractive=False) and -Unattended not set; running headless with -Test* parameters.'
+}
 
 if ($useUI) {
 try {
@@ -980,7 +1027,10 @@ try {
     $sn = (Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber
     if ($sn -and $sn.Trim().Length -gt 0 -and $sn -notmatch 'O\.E\.M\.|Default|System Serial|To Be Filled') {
         $newName = $sn.Trim() -replace '[^A-Za-z0-9-]', ''
-        if ($newName.Length -gt 15) { $newName = $newName.Substring(0, 15) }
+        if ($newName.Length -gt 15) {
+            Write-Log 'WARN' "Serial '$newName' exceeds the 15-char NetBIOS limit; truncated to '$($newName.Substring(0, 15))'"
+            $newName = $newName.Substring(0, 15)
+        }
         if ($env:COMPUTERNAME -eq $newName) {
             Write-Log 'OK' "PC already named $newName"
         } else {
@@ -1035,6 +1085,12 @@ try {
             $missNet = @('StaticPrefixLength', 'StaticGateway', 'DnsServers') |
                        Where-Object { -not (Get-Variable $_ -ValueOnly -ErrorAction SilentlyContinue) }
             if ($missNet) { throw "config.ps1 does not define for static IP: $($missNet -join ', ')" }
+            # Drop any IP already on the adapter (previous run / manual config) so New-NetIPAddress
+            # does not fail with "object already exists".
+            Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+                Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
             New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $StaticIp `
                              -PrefixLength $StaticPrefixLength -DefaultGateway $StaticGateway -ErrorAction Stop | Out-Null
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
@@ -1118,6 +1174,7 @@ try {
 # registers (the join guarantees the installer exited). The port does not depend on the
 # driver, so it is created here.
 $script:PrinterPort = $null
+$script:PrinterInstalled = $false
 if ($SelectedPrinter) {
     try {
         $epson = Get-ChildItem -Path $PathEpson -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1184,8 +1241,12 @@ Set-Phase 'Phase 7 - finishing installers and dependent steps'
 # the progress window lives on its own thread, so it stays responsive while we wait here.
 foreach ($bgItem in $BgInstalls) {
     try {
-        $bgItem.Proc.WaitForExit()
-        Write-ProcResult $bgItem.Name $bgItem.Proc $bgItem.OkCodes
+        if ($bgItem.Proc) {
+            $bgItem.Proc.WaitForExit()
+            Write-ProcResult $bgItem.Name $bgItem.Proc $bgItem.OkCodes
+        } else {
+            Write-Log 'ERROR' "$($bgItem.Name): process did not start (skipped join)"
+        }
     } catch { Write-Log 'ERROR' "$($bgItem.Name) (join): $($_.Exception.Message)" }
 }
 
@@ -1194,7 +1255,7 @@ foreach ($bgItem in $BgInstalls) {
 if ($SelectedPrinter -and $script:PrinterPort) {
     try {
         $driverName = $null
-        for ($d = 0; $d -lt 30 -and -not $driverName; $d++) {
+        for ($d = 0; $d -lt 60 -and -not $driverName; $d++) {
             $driverObj = Get-PrinterDriver -ErrorAction SilentlyContinue |
                          Where-Object { $_.Name -match 'Epson' } | Select-Object -First 1
             if ($driverObj) { $driverName = $driverObj.Name } else { Start-Sleep -Milliseconds 500 }
@@ -1202,6 +1263,7 @@ if ($SelectedPrinter -and $script:PrinterPort) {
         if ($driverName) {
             Add-Printer -Name $SelectedPrinter.name -DriverName $driverName `
                         -PortName $script:PrinterPort -ErrorAction Stop | Out-Null
+            $script:PrinterInstalled = $true
             Write-Log 'OK' "Printer: $($SelectedPrinter.name) [$($SelectedPrinter.ip)]"
         } else {
             Write-Log 'WARN' "Epson driver not located - add the printer manually"
@@ -1219,9 +1281,8 @@ if ($InstallWebAgent) {
 
         if ($waMsi) {
             Write-Log 'INFO' "WebAgent MSI: $($waMsi.Name)"
-            $p = Start-Process -FilePath 'msiexec.exe' `
-                 -ArgumentList '/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
-            Write-ProcResult 'WebAgent (MSI)' $p @(0, 3010)
+            $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart')
+            if ($p) { Write-ProcResult 'WebAgent (MSI)' $p @(0, 3010) }
         } elseif ($waZip) {
             Write-Log 'INFO' "WebAgent ZIP: $($waZip.Name) - extracting..."
             $extractDir = "$env:TEMP\webagent_extract"
@@ -1229,16 +1290,15 @@ if ($InstallWebAgent) {
             Expand-Archive -Path $waZip.FullName -DestinationPath $extractDir -Force
             $msiInZip = Get-ChildItem -Path $extractDir -Filter '*.msi' -Recurse | Select-Object -First 1
             if ($msiInZip) {
-                $p = Start-Process -FilePath 'msiexec.exe' `
-                     -ArgumentList '/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart' -Wait -PassThru
-                Write-ProcResult 'WebAgent (ZIP)' $p @(0, 3010)
+                $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart')
+                if ($p) { Write-ProcResult 'WebAgent (ZIP)' $p @(0, 3010) }
             } else {
                 Write-Log 'WARN' "No MSI found inside the ZIP"
             }
         } elseif ($waExe) {
             Write-Log 'INFO' "WebAgent EXE (legacy): $($waExe.Name)"
-            $p = Start-Process -FilePath $waExe.FullName -ArgumentList '/S' -Wait -PassThru
-            Write-ProcResult 'WebAgent (EXE)' $p
+            $p = Invoke-InstallerWithTimeout $waExe.FullName @('/S')
+            if ($p) { Write-ProcResult 'WebAgent (EXE)' $p }
         } else {
             Write-Log 'WARN' "WebAgent installer not found in $PathWebAgent"
         }
@@ -1261,7 +1321,7 @@ PENDING:
 [ ] Register the machine on the intranet
 [ ] Office 365 login: $Email
 [ ] Verify the signature in Outlook
-[ ] Test the printer: $(if ($SelectedPrinter) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { 'None' })
+[ ] Test the printer: $(if ($SelectedPrinter) { if ($script:PrinterInstalled) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)] - INSTALL FAILED, add it manually" } } else { 'None' })
 [ ] TOTVS (if requested in the ticket)
 [ ] Hand over credentials: login=$Username / password=(see config.ps1 - do not record in the log)
 ========================================
@@ -1277,10 +1337,10 @@ if ($script:LogQueue) {
     }
 }
 
-if ($script:Erros.Count -gt 0) {
-    $s = if ($script:Erros.Count -ne 1) { 's' } else { '' }
-    Write-Log 'INFO' "Setup completed with $($script:Erros.Count) error$s"
-    if ($script:UiState) { $script:UiState.Status = "Done - $($script:Erros.Count) error$s. Review the red lines above, then close." }
+if ($script:Errors.Count -gt 0) {
+    $s = if ($script:Errors.Count -ne 1) { 's' } else { '' }
+    Write-Log 'INFO' "Setup completed with $($script:Errors.Count) error$s"
+    if ($script:UiState) { $script:UiState.Status = "Done - $($script:Errors.Count) error$s. Review the red lines above, then close." }
     $exitCode = 1
 } else {
     Write-Log 'OK' "setup.ps1 completed without errors"
