@@ -1,0 +1,17 @@
+title = "gitleaks config - windows-automatization"
+
+# Start from gitleaks' built-in rules, then allowlist the files that intentionally
+# ship placeholder or fake values (templates + test fixtures). Real secrets never
+# live in the repo (config.ps1 / autounattend.xml / printers.json are gitignored).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Templates and test fixtures: placeholders / fake credentials only"
+paths = [
+  '''config\.example\.ps1''',
+  '''configuration\.example\.xml''',
+  '''printers\.example\.json''',
+  '''tests/test-config\.ps1''',
+  '''tests/usb-sim/.*''',
+]

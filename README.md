@@ -1,5 +1,6 @@
 # 🖥️ Windows 11 — Automated Provisioning
 
+[![CI](https://github.com/bytedump/windows-automatization/actions/workflows/ci.yml/badge.svg)](https://github.com/bytedump/windows-automatization/actions/workflows/ci.yml)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=flat&logo=powershell&logoColor=white)
 ![Windows 11](https://img.shields.io/badge/Windows%2011-0078D6?style=flat&logo=windows&logoColor=white)
 ![autounattend.xml](https://img.shields.io/badge/autounattend.xml-1e2327?style=flat)
@@ -446,6 +447,31 @@ manual checklist item.
 ---
 
 ## 🧪 4. How to test
+
+Testing happens at two levels. **CI** runs automatically on every push/PR and checks the
+things that can be verified without a real machine; the **end-to-end** paths (Sandbox, VM,
+hardware) stay manual because they actually install Windows / mutate the system.
+
+### Continuous integration (automated, on every push/PR)
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on GitHub Actions:
+
+| Check | Tool | What it guards |
+|---|---|---|
+| Lint | PSScriptAnalyzer ([`PSScriptAnalyzerSettings.psd1`](PSScriptAnalyzerSettings.psd1)) | PowerShell bugs / style |
+| Unit tests | Pester 5 ([`tests/unit/`](tests/unit)) | the pure validators in `setup.ps1` (IP, username, name normalization) |
+| Secret scan | gitleaks ([`.gitleaks.toml`](.gitleaks.toml)) | no real credential ever lands in the repo |
+| XML | `[xml]` parse | `autounattend.template.xml` / `configuration.example.xml` are well-formed |
+
+The unit tests dot-source `setup.ps1` with `-LoadOnly`, which defines the validator functions
+and returns before the provisioning body — so they run on any machine and touch nothing.
+
+```powershell
+# run the unit tests locally (needs Pester 5):
+Invoke-Pester -Path .\tests\unit -Output Detailed
+```
+
+> CI does **not** install Windows or create users — that needs the manual e2e paths below.
 
 ### setup.ps1 — Windows Sandbox (isolated, recommended)
 

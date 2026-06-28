@@ -7,7 +7,10 @@ param(
     [string]$TestSector    = '',
     [switch]$TestStaticIp,
     [string]$TestIpAddress = '',
-    [switch]$TestWebAgent
+    [switch]$TestWebAgent,
+    # Test seam: dot-source with -LoadOnly to define the pure validator functions below
+    # WITHOUT running the provisioning body (used by tests/unit). Never set in production.
+    [switch]$LoadOnly
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -77,6 +80,10 @@ function Format-Username {
     if ($ft.Count -eq 0 -or $lt.Count -eq 0) { return '' }
     return ($ft[0] + '.' + $lt[-1]).ToLower()
 }
+
+# Test seam: when dot-sourced with -LoadOnly (tests/unit), stop here so only the pure
+# validator functions above are defined - the provisioning body below never runs.
+if ($LoadOnly) { return }
 
 # ============================================================
 # setup.ps1 - Windows 11 Setup
