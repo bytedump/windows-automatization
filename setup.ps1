@@ -366,6 +366,40 @@ if ($missing) {
     exit 1
 }
 
+# ============================================================
+# Context guard (production path only) - run BEFORE any mutation.
+# ============================================================
+# This script is about to rotate $AdminAccount's password and (in the two-phase flow) disable
+# that account and write machine handoff state. It MUST be running elevated AND as the bootstrap
+# admin account that autounattend created + AutoLogon'd; doing this from the wrong identity would
+# corrupt the wrong account and write to the wrong profile. Abort here, before the first change.
+# Exit 2 = fatal precondition (autounattend FirstLogonCommands propagates it - see exit contract:
+# 0 = success, 1 = errors tracked, 2 = fatal guard/config). Skipped under -Unattended, which is
+# the test/headless seam (the harness runs as the sandbox guest, not as $AdminAccount).
+if (-not $Unattended) {
+    try {
+        $currentId  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $isElevated = ([System.Security.Principal.WindowsPrincipal]$currentId).IsInRole(
+            [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $isElevated = $false
+    }
+    if (-not $isElevated) {
+        $msg = 'setup.ps1 must run elevated (as Administrator). Aborting before any change.'
+        Write-Log 'FATAL' $msg
+        [System.Windows.Forms.MessageBox]::Show($msg, 'Setup - not elevated', 'OK', 'Error') | Out-Null
+        exit 2
+    }
+    if ($env:USERNAME -ine $AdminAccount) {
+        $msg = "setup.ps1 must run as the bootstrap admin '$AdminAccount', " +
+               "but the current user is '$env:USERNAME'. Aborting before any change."
+        Write-Log 'FATAL' $msg
+        [System.Windows.Forms.MessageBox]::Show($msg, 'Setup - wrong account', 'OK', 'Error') | Out-Null
+        exit 2
+    }
+    Write-Log 'OK' "Context guard passed: elevated, running as $env:USERNAME"
+}
+
 # OPTIONAL config: if config.ps1 omits it, create it as $null so StrictMode does not blow up
 # later (e.g. `if ($WifiSSID)` indexes the missing variable and is FATAL under StrictMode).
 # All of these are used under a guard (`if ($Var)`) or validated at the point of use.
