@@ -133,7 +133,7 @@ the USB drive at build time and are all gitignored.
 | Item | Where it lives |
 |---|---|
 | Bootstrap admin password | Only in the **generated** `autounattend.xml` (gitignored), created by `build-usb.ps1`. Replaced on first login by `setup.ps1`, which then **deletes** `autounattend.xml` from the USB and the `Panther\unattend.xml` copy. |
-| Real admin / user passwords | Only in `config.ps1` (gitignored) — `$AdminNewPass`, `$UserInitialPass` |
+| Real admin / user passwords | Only in `config.ps1` (gitignored) — `$AdminNewPass`, `$UserInitialPass`. ⚠️ `$AdminNewPass` is typically **reused fleet-wide** (the same local-admin password on every provisioned machine): a leak on one machine affects all of them, and rotating it means updating `config.ps1` and re-running setup everywhere. |
 | Share / WiFi credentials | Only in `config.ps1` (gitignored) |
 | Printer IPs / sectors | Only in `printers.json` (gitignored) — internal network data |
 | Outlook signatures | Only in `assinatura-2026/` (gitignored) — employee personal data |
@@ -143,10 +143,12 @@ the USB drive at build time and are all gitignored.
 
 > **Physical security of the USB.** Until `setup.ps1` finishes its first run, the USB carries
 > live credentials in cleartext: the real passwords in `config.ps1` and the bootstrap password
-> in `autounattend.xml` (Windows-reversible base64). Treat the prepared USB as a secret — keep it
-> in locked storage, do not leave it in public machines, and ideally keep it on an encrypted
-> volume. `setup.ps1` scrubs `autounattend.xml` after rotating the password, but `config.ps1`
-> stays on the USB by design (so the operator can re-run setup).
+> in `autounattend.xml`. The bootstrap password is **base64-encoded, not encrypted** — base64 is
+> trivially reversible, so anyone holding the USB can decode it. Treat the prepared USB as a secret:
+> keep it in locked storage, never leave it in public machines, and store it on an **encrypted
+> volume — use BitLocker To Go** (*This PC → right-click the USB → Turn on BitLocker*) or an
+> equivalent such as VeraCrypt. `setup.ps1` scrubs `autounattend.xml` after rotating the password,
+> but `config.ps1` stays on the USB by design (so the operator can re-run setup).
 
 ### Why a bootstrap password at all
 

@@ -41,9 +41,5 @@
         # Best-effort cleanup blocks (progress-runspace dispose, log enqueue). Intentional
         # for now; revisit after Stage 4 to add explicit error logging where useful.
         'PSAvoidUsingEmptyCatchBlock'
-
-        # build-usb.ps1 -AdminPassword is a plaintext [string] param. Stage 1 converts it to
-        # [securestring]; REMOVE this exclusion once that lands so the rule guards it again.
-        'PSAvoidUsingPlainTextForPassword'
     )
 }

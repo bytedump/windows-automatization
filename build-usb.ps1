@@ -21,13 +21,20 @@
 .EXAMPLE
     .\build-usb.ps1 -AdminUser setupadmin -OutPath E:\autounattend.xml
     # Prompts only for the password (hidden), writes straight to the USB root (E:)
+
+.EXAMPLE
+    $pw = Read-Host 'Bootstrap password' -AsSecureString
+    .\build-usb.ps1 -AdminUser setupadmin -AdminPassword $pw -OutPath E:\autounattend.xml -Force
+    # Non-interactive: -AdminPassword takes a [securestring] (never a plaintext string);
+    # -Force overwrites an existing autounattend.xml (re-burns the bootstrap password).
 #>
 [CmdletBinding()]
 param(
     [string]$TemplatePath,
     [string]$OutPath,
     [string]$AdminUser,
-    [string]$AdminPassword
+    [securestring]$AdminPassword,
+    [switch]$Force
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -50,26 +57,47 @@ if (-not $AdminUser) {
 }
 if (-not $AdminUser) { throw 'Account name cannot be empty.' }
 
-# --- Password (hidden; converted to plain text only long enough to build the base64) ---
+# --- Password (kept as SecureString; converted to plaintext only long enough to enforce a
+# minimum length and build the base64, then scrubbed). The -AdminPassword parameter is a
+# [securestring] so a plaintext password can never be passed on the command line. ---
+$MinPasswordLength = 12
+
 if (-not $AdminPassword) {
-    $sec  = Read-Host 'Bootstrap admin account password' -AsSecureString
-    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-    try   { $AdminPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    $AdminPassword = Read-Host 'Bootstrap admin account password' -AsSecureString
 }
-if (-not $AdminPassword) { throw 'Password cannot be empty.' }
+if ($AdminPassword.Length -eq 0) { throw 'Password cannot be empty.' }
 
 # Windows expects the value as base64 of UTF-16LE of (password + "Password" suffix),
 # for both LocalAccount and AutoLogon. Same value in both places.
-$pwB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($AdminPassword + 'Password'))
-# Scrub the plaintext password from memory now that the base64 is built (defense-in-depth).
-$AdminPassword = $null
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($AdminPassword)
+try {
+    $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    if ($plain.Length -lt $MinPasswordLength) {
+        throw "Password too short: minimum $MinPasswordLength characters (bootstrap admin is reused fleet-wide)."
+    }
+    $pwB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($plain + 'Password'))
+}
+finally {
+    # Scrub the plaintext from memory now that the base64 is built (defense-in-depth).
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    $plain = $null
+}
 
 $xml = Get-Content -Path $TemplatePath -Raw -Encoding UTF8
 $xml = $xml.Replace('__ADMIN_USER__', $AdminUser).Replace('__ADMIN_PW_B64__', $pwB64)
 
 if ($xml -match '__ADMIN_USER__|__ADMIN_PW_B64__') {
     throw 'An unreplaced placeholder remains in the XML - aborting.'
+}
+
+# Overwrite guard: autounattend.xml holds a (base64-encoded) bootstrap password. Refuse to
+# silently clobber an existing one — re-running could burn a different/stale password without
+# the operator noticing. Surface the existing file's age; require -Force to overwrite.
+if ((Test-Path $OutPath) -and -not $Force) {
+    $existing = Get-Item $OutPath
+    throw ("Refusing to overwrite existing autounattend.xml at $OutPath " +
+           "(last modified $($existing.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))). " +
+           'Pass -Force to overwrite — this re-burns the bootstrap password.')
 }
 
 # UTF-8 without BOM (autounattend expects UTF-8).
