@@ -81,6 +81,34 @@ function Format-Username {
     return ($ft[0] + '.' + $lt[-1]).ToLower()
 }
 
+# Build the Phase A -> Phase B handoff state object (serialized to state.json in PHASE 8). Pure:
+# string-in / object-out, references no config/form vars, so tests dot-source this file with
+# -LoadOnly and round-trip it against phase-b.ps1's Read-CorpState. Takes NO credential - state.json
+# never carries one, and the field set here IS the contract phase-b reads. The 3 required fields are
+# Mandatory (a blank one can't even be built); Read-CorpState re-checks them on read (defense in depth).
+function New-CorpStateObject {
+    param(
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$FullName,
+        [Parameter(Mandatory)][string]$Email,
+        [string]$EmailDomain   = '',
+        [string]$SectorName    = '',
+        [string]$SigTemplate   = '',
+        [string]$PrinterName   = '',
+        [string]$WallpaperPath = ''
+    )
+    return [pscustomobject]@{
+        Username      = $Username
+        FullName      = $FullName
+        Email         = $Email
+        EmailDomain   = $EmailDomain
+        SectorName    = $SectorName
+        SigTemplate   = $SigTemplate
+        PrinterName   = $PrinterName
+        WallpaperPath = $WallpaperPath
+    }
+}
+
 # Test seam: when dot-sourced with -LoadOnly (tests/unit), stop here so only the pure
 # validator functions above are defined - the provisioning body below never runs.
 if ($LoadOnly) { return }
