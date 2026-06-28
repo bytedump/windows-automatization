@@ -8,6 +8,13 @@ param(
     [switch]$TestStaticIp,
     [string]$TestIpAddress = '',
     [switch]$TestWebAgent,
+    # Two-phase handoff (PHASE 8). OFF by default so the harness (interactive sandbox + -Headless)
+    # and any single-phase run behave as before - they never stage, arm AutoLogon, or reboot.
+    # Production turns it on via autounattend (task 3e). -EnableHandoff: stage Phase B + register the
+    # tasks + arm AutoLogon + reboot. -NoReboot (with -EnableHandoff): stage + arm but skip the
+    # Restart-Computer (throwaway-VM inspection only - leaves the plaintext password in HKLM).
+    [switch]$EnableHandoff,
+    [switch]$NoReboot,
     # Test seam: dot-source with -LoadOnly to define the pure validator functions below
     # WITHOUT running the provisioning body (used by tests/unit). Never set in production.
     [switch]$LoadOnly
@@ -1383,6 +1390,88 @@ Add-Content -Path $LogFile -Value $checklist -Encoding UTF8 -ErrorAction Silentl
 if ($script:LogQueue) {
     foreach ($cl in ($checklist -split "`n")) {
         $script:LogQueue.Enqueue([pscustomobject]@{ Level = 'INFO'; Line = $cl })
+    }
+}
+
+# ============================================================
+# PHASE 8 - Phase B handoff: STAGING (PREP) - only under -EnableHandoff
+# ============================================================
+# Stage everything Phase B + cleanup need into C:\ProgramData\CorpSetup and register the two
+# -AtLogOn tasks. This does NOT arm AutoLogon or reboot - that is the COMMIT block at the very end,
+# after the technician has reviewed the log and closed the progress window. Runs here (before the
+# exit-code tally) so its log lines stream into the window and any failure counts toward $exitCode.
+# The folder keeps the INHERITED ProgramData ACL on purpose: the standard user must READ
+# state.json/Signatures and WRITE its logs + user-done here, and that default ACL already stops the
+# user from overwriting the admin-owned cleanup.ps1 (which SYSTEM runs) - the only thing worth
+# guarding. state.json never holds a credential.
+if ($EnableHandoff) {
+    Set-Phase 'Phase 8 - Phase B handoff (staging + tasks)'
+    $StateDir = Join-Path $env:ProgramData 'CorpSetup'
+    try {
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+
+        # state.json - NO credential (the AutoLogon password goes to HKLM in COMMIT, never to disk here).
+        $printerName = if ($SelectedPrinter) { $SelectedPrinter.name } else { '' }
+        $state = New-CorpStateObject -Username $Username -FullName $FullName -Email $Email `
+                    -EmailDomain $EmailDomain -SectorName $SectorName -SigTemplate $SigTemplate `
+                    -PrinterName $printerName -WallpaperPath $script:WallpaperStaged
+        $state | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $StateDir 'state.json') -Encoding UTF8 -Force
+        Write-Log 'OK' 'state.json written (no credentials)'
+
+        # Stage the Phase B + cleanup scripts off the USB (it may be pulled before the user logs on).
+        foreach ($s in 'phase-b.ps1', 'cleanup.ps1') {
+            $src = Join-Path $ScriptDir $s
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $StateDir $s) -Force
+                Write-Log 'OK' "Staged: $s"
+            } else {
+                Write-Log 'ERROR' "Handoff: $s not found at $ScriptDir - cannot stage (Phase B will not run)"
+            }
+        }
+
+        # Stage the selected sector's signature subtree (recursive: *.htm + the <template>_files logo
+        # folders). phase-b resolves Signatures\<domain>\<sector>\..., so preserve that two-level depth.
+        # Skip when there is no real sector (mirrors phase-b's own '(...)'/empty skip).
+        if ($SectorName -and $SectorName -notmatch '^\(') {
+            $sigSrc = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
+            if (Test-Path -LiteralPath $sigSrc) {
+                # Copy the sector's CONTENTS into the dest sector folder (not the folder itself), so a
+                # re-run (run.bat) overwrites in place instead of nesting <sector>\<sector>.
+                $sigDest = Join-Path $StateDir (Join-Path 'Signatures' (Join-Path $EmailDomain $SectorName))
+                New-Item -ItemType Directory -Path $sigDest -Force | Out-Null
+                Copy-Item -Path (Join-Path $sigSrc '*') -Destination $sigDest -Recurse -Force
+                Write-Log 'OK' "Signature sector staged: $EmailDomain\$SectorName"
+            } else {
+                Write-Log 'WARN' "Signature source not found (Phase B will skip signature): $sigSrc"
+            }
+        }
+
+        # Register the two -AtLogOn tasks (idempotent via -Force). Names are the exact contract
+        # cleanup.ps1 hardcodes. The user task runs as the new user (resolved by SID - immune to the
+        # pending PC rename) in its interactive session; the SYSTEM task runs cleanup at highest priv.
+        $userSid = (Get-LocalUser -Name $Username -ErrorAction Stop).SID.Value
+        $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+        $uAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $StateDir 'phase-b.ps1'))
+        $uTrig   = New-ScheduledTaskTrigger -AtLogOn -User $Username
+        $uTrig.Delay = 'PT30S'   # let the profile / print spooler settle before SetDefaultPrinter
+        $uPrin   = New-ScheduledTaskPrincipal -UserId $userSid -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName 'CorpSetup-PhaseB-User' -Action $uAction -Trigger $uTrig `
+            -Principal $uPrin -Settings $set -Force | Out-Null
+        Write-Log 'OK' 'Task registered: CorpSetup-PhaseB-User'
+
+        $sAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $StateDir 'cleanup.ps1'))
+        $sTrig   = New-ScheduledTaskTrigger -AtLogOn -User $Username
+        $sPrin   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName 'CorpSetup-PhaseB-System' -Action $sAction -Trigger $sTrig `
+            -Principal $sPrin -Settings $set -Force | Out-Null
+        Write-Log 'OK' 'Task registered: CorpSetup-PhaseB-System'
+
+        Write-Log 'INFO' 'Phase B staged. Closing this window will REBOOT the PC to run Phase B.'
+    } catch {
+        Write-Log 'ERROR' "Handoff staging: $($_.Exception.Message)"
     }
 }
 
