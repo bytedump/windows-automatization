@@ -1052,14 +1052,6 @@ if ($WifiSSID) { try {
     Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
 } } else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
 
-# Map the share
-if ($SharePath) { try {
-    New-SmbMapping -RemotePath $SharePath -UserName $ShareUser -Password $SharePass -Persistent $false -ErrorAction Stop | Out-Null
-    Write-Log 'OK' "Share mapped: $SharePath"
-} catch {
-    Write-Log 'WARN' "Share: $($_.Exception.Message)"
-} } else { Write-Log 'WARN' "Share skipped (SharePath empty)" }
-
 # Background-installer pool. Defined before first use; Ninite starts here (the longest installer)
 # and downloads while PHASE 4-6 run; the rest of the pool joins in PHASE 7. MSI mutex: Ninite and
 # WebAgent never overlap (WebAgent only runs in PHASE 7, after the pool). NOTE: Ninite used to be
