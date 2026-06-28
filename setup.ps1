@@ -411,103 +411,13 @@ foreach ($o in $OptionalConfig) {
     }
 }
 
-# Activate Windows with the OEM key from the UEFI firmware (Dell OA3)
-try {
-    $oemKey = (Get-CimInstance SoftwareLicensingService -ErrorAction Stop).OA3xOriginalProductKey
-    if ($oemKey -and $oemKey.Trim().Length -gt 0) {
-        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ipk $oemKey 2>&1 | Out-Null
-        # /ipk via cscript is synchronous (cscript waits for the script); /ato can follow directly.
-        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato 2>&1 | Out-Null
-        Write-Log 'OK' "OEM firmware key applied and activation requested"
-    } else {
-        Write-Log 'WARN' "No OEM key found in the UEFI firmware"
-    }
-} catch {
-    # Activation is best-effort and never blocks provisioning (the machine works
-    # unactivated). A sandbox/VM has no firmware OEM key, so this WARNs rather than ERRORs
-    # to avoid failing the whole run on a non-critical step. Verify activation in the checklist.
-    Write-Log 'WARN' "OEM activation skipped/failed: $($_.Exception.Message)"
-}
-
-# Rotate the admin account bootstrap password ($AdminAccount, created by autounattend)
-# to the real password from config.ps1
-try {
-    $adminPass = ConvertTo-SecureString $AdminNewPass -AsPlainText -Force
-    Set-LocalUser -Name $AdminAccount -Password $adminPass -ErrorAction Stop
-    Write-Log 'OK' "$AdminAccount password updated (bootstrap removed)"
-    # The bootstrap password now lives only in autounattend.xml on the USB (Windows-reversible
-    # base64) and in Windows' own copy at Panther\unattend.xml. It has been rotated, so both are
-    # dead weight + a credential on disk: scrub them. (config.ps1 stays - run.bat may re-run setup.)
-    foreach ($u in @((Join-Path $ScriptDir 'autounattend.xml'), "$env:WINDIR\Panther\unattend.xml")) {
-        if (Test-Path $u) {
-            try { Remove-Item -LiteralPath $u -Force -ErrorAction Stop; Write-Log 'OK' "Removed bootstrap credential file: $u" }
-            catch { Write-Log 'WARN' "Could not remove ${u}: $($_.Exception.Message)" }
-        }
-    }
-} catch {
-    Write-Log 'ERROR' "Rotate ${AdminAccount} password: $($_.Exception.Message)"
-    # Failing here leaves the machine on the BOOTSTRAP password (the autounattend one). Treat it
-    # as serious: a blocking alert in interactive mode + the error is already in the final summary (exit 1).
-    if (-not $Unattended) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "FAILED TO ROTATE THE $AdminAccount PASSWORD.`n`nThe machine is on the BOOTSTRAP password. " +
-            "Change it manually BEFORE handing it over (e.g. net user $AdminAccount *).`n`nError: $($_.Exception.Message)",
-            'Setup - SECURITY RISK', 'OK', 'Error') | Out-Null
-    }
-}
-
 # ============================================================
-# PHASE 2 - WiFi, share and initial data
+# Pre-form data load (reads only - NO machine mutation here)
 # ============================================================
-
-# WiFi
-if ($WifiSSID) { try {
-    $escapedSSID = [System.Security.SecurityElement]::Escape($WifiSSID)
-    $escapedPass = [System.Security.SecurityElement]::Escape($WifiPass)
-    $wifiXml = @"
-<?xml version="1.0"?>
-<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
-  <name>$escapedSSID</name>
-  <SSIDConfig><SSID><name>$escapedSSID</name></SSID></SSIDConfig>
-  <connectionType>ESS</connectionType>
-  <connectionMode>auto</connectionMode>
-  <MSM><security>
-    <authEncryption>
-      <authentication>WPA2PSK</authentication>
-      <encryption>AES</encryption>
-      <useOneX>false</useOneX>
-    </authEncryption>
-    <sharedKey>
-      <keyType>passPhrase</keyType>
-      <protected>false</protected>
-      <keyMaterial>$escapedPass</keyMaterial>
-    </sharedKey>
-  </security></MSM>
-</WLANProfile>
-"@
-    $wifiXmlPath = "$env:TEMP\corp_wifi_profile.xml"
-    try {
-        Set-Content -Path $wifiXmlPath -Value $wifiXml -Encoding UTF8
-        netsh wlan add profile filename="$wifiXmlPath" 2>&1 | Out-Null
-        # add profile writes the profile synchronously; connect can be issued directly.
-        netsh wlan connect name="$WifiSSID" 2>&1 | Out-Null
-        Write-Log 'OK' "WiFi $WifiSSID configured"
-    } finally {
-        # The temp profile holds the WPA2 PSK in plaintext; delete it as soon as netsh imported
-        # it (previously it was left behind, readable, in %TEMP%).
-        Remove-Item -Path $wifiXmlPath -Force -ErrorAction SilentlyContinue
-    }
-} catch {
-    Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
-} } else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
-
-# Map the share
-if ($SharePath) { try {
-    New-SmbMapping -RemotePath $SharePath -UserName $ShareUser -Password $SharePass -Persistent $false -ErrorAction Stop | Out-Null
-    Write-Log 'OK' "Share mapped: $SharePath"
-} catch {
-    Write-Log 'WARN' "Share: $($_.Exception.Message)"
-} } else { Write-Log 'WARN' "Share skipped (SharePath empty)" }
+# OEM activation, admin-password rotation, WiFi, share mapping and the Ninite launch used to run
+# HERE, before the form. They mutate the machine, so they moved into PHASE A (below), which only
+# runs after the operator confirms - a Cancel must change nothing. The one thing still needed
+# before the form is the read-only data the form renders (printers).
 
 # Load printers.json from the USB
 $Printers = @()
@@ -531,37 +441,6 @@ if (Test-Path $PrintersJson) {
     }
 } else {
     Write-Log 'WARN' "printers.json not found on the USB"
-}
-
-# ============================================================
-# Pre-GUI - kick off Ninite early (overlaps with the technician filling the form)
-# ============================================================
-# Ninite is the longest installer (downloads several apps from the internet). Launched HERE,
-# it downloads while the technician fills the form (dead time). Internet comes from the WiFi
-# (PHASE 2, DHCP, already up); it does not depend on Ethernet, which is configured in PHASE 4.
-# The pool infra (Start-BgInstall/$BgInstalls) is defined here and reused in PHASE 5; the join
-# of all of them is in PHASE 7. MSI mutex: Ninite and WebAgent never overlap (WebAgent only runs
-# in PHASE 7, after the pool).
-$BgInstalls = [System.Collections.Generic.List[object]]::new()
-function Start-BgInstall {
-    param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0), [string]$WorkingDirectory)
-    $params = @{ FilePath = $FilePath; PassThru = $true }
-    if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
-    # ODT (and any installer that resolves source files relative to CWD) needs a deterministic
-    # working dir; without it Start-Process inherits whatever launched setup.ps1 (system32).
-    if ($WorkingDirectory) { $params['WorkingDirectory'] = $WorkingDirectory }
-    $proc = Start-Process @params
-    $BgInstalls.Add([pscustomobject]@{ Name = $Name; Proc = $proc; OkCodes = $OkCodes })
-    Write-Log 'INFO' "$Name started in the background (PID $($proc.Id))"
-    return $proc
-}
-
-$NinitePath = Join-Path $ScriptDir 'ninite.exe'
-if (Test-Path $NinitePath) {
-    try { Start-BgInstall 'Ninite' $NinitePath | Out-Null }
-    catch { Write-Log 'ERROR' "Ninite: $($_.Exception.Message)" }
-} else {
-    Write-Log 'WARN' "ninite.exe not found on the USB"
 }
 
 # ============================================================
@@ -1077,6 +956,136 @@ Write-Log 'INFO' "Name=$FullName | User=$Username | Email=$Email"
 Write-Log 'INFO' "Network=$(if ($UseStatic) { "Static $StaticIp" } else { 'DHCP' })"
 Write-Log 'INFO' "Printer=$(if ($SelectedPrinter) { $SelectedPrinter.name } else { 'None' })"
 Write-Log 'INFO' "Sector=$SectorName | Template=$SigTemplate | WebAgent=$InstallWebAgent"
+
+# ============================================================
+# PHASE A - machine-scope provisioning (FIRST point that mutates the machine)
+# ============================================================
+# Everything above only READ config/printers and collected inputs; a Cancel on the form exited 0
+# having changed nothing. From here down the machine is mutated, so these steps run ONLY after the
+# operator confirmed (form OK) or in headless mode - never on Cancel. This kills the old
+# "cancel after mutations -> exit 0 on a half-changed machine" bug.
+Set-Phase 'Phase A - activation, admin password, network base, installers'
+
+# Activate Windows with the OEM key from the UEFI firmware (Dell OA3)
+try {
+    $oemKey = (Get-CimInstance SoftwareLicensingService -ErrorAction Stop).OA3xOriginalProductKey
+    if ($oemKey -and $oemKey.Trim().Length -gt 0) {
+        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ipk $oemKey 2>&1 | Out-Null
+        # /ipk via cscript is synchronous (cscript waits for the script); /ato can follow directly.
+        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato 2>&1 | Out-Null
+        Write-Log 'OK' "OEM firmware key applied and activation requested"
+    } else {
+        Write-Log 'WARN' "No OEM key found in the UEFI firmware"
+    }
+} catch {
+    # Activation is best-effort and never blocks provisioning (the machine works
+    # unactivated). A sandbox/VM has no firmware OEM key, so this WARNs rather than ERRORs
+    # to avoid failing the whole run on a non-critical step. Verify activation in the checklist.
+    Write-Log 'WARN' "OEM activation skipped/failed: $($_.Exception.Message)"
+}
+
+# Rotate the admin account bootstrap password ($AdminAccount, created by autounattend)
+# to the real password from config.ps1
+try {
+    $adminPass = ConvertTo-SecureString $AdminNewPass -AsPlainText -Force
+    Set-LocalUser -Name $AdminAccount -Password $adminPass -ErrorAction Stop
+    Write-Log 'OK' "$AdminAccount password updated (bootstrap removed)"
+    # The bootstrap password now lives only in autounattend.xml on the USB (base64-encoded, not
+    # encrypted) and in Windows' own copy at Panther\unattend.xml. It has been rotated, so both are
+    # dead weight + a credential on disk: scrub them. (config.ps1 stays - run.bat may re-run setup.)
+    foreach ($u in @((Join-Path $ScriptDir 'autounattend.xml'), "$env:WINDIR\Panther\unattend.xml")) {
+        if (Test-Path $u) {
+            try { Remove-Item -LiteralPath $u -Force -ErrorAction Stop; Write-Log 'OK' "Removed bootstrap credential file: $u" }
+            catch { Write-Log 'WARN' "Could not remove ${u}: $($_.Exception.Message)" }
+        }
+    }
+} catch {
+    Write-Log 'ERROR' "Rotate ${AdminAccount} password: $($_.Exception.Message)"
+    # Failing here leaves the machine on the BOOTSTRAP password (the autounattend one). Treat it
+    # as serious: a blocking alert in interactive mode + the error is already in the final summary (exit 1).
+    if (-not $Unattended) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "FAILED TO ROTATE THE $AdminAccount PASSWORD.`n`nThe machine is on the BOOTSTRAP password. " +
+            "Change it manually BEFORE handing it over (e.g. net user $AdminAccount *).`n`nError: $($_.Exception.Message)",
+            'Setup - SECURITY RISK', 'OK', 'Error') | Out-Null
+    }
+}
+
+# WiFi (brings up internet for the Ninite download below)
+if ($WifiSSID) { try {
+    $escapedSSID = [System.Security.SecurityElement]::Escape($WifiSSID)
+    $escapedPass = [System.Security.SecurityElement]::Escape($WifiPass)
+    $wifiXml = @"
+<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>$escapedSSID</name>
+  <SSIDConfig><SSID><name>$escapedSSID</name></SSID></SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>auto</connectionMode>
+  <MSM><security>
+    <authEncryption>
+      <authentication>WPA2PSK</authentication>
+      <encryption>AES</encryption>
+      <useOneX>false</useOneX>
+    </authEncryption>
+    <sharedKey>
+      <keyType>passPhrase</keyType>
+      <protected>false</protected>
+      <keyMaterial>$escapedPass</keyMaterial>
+    </sharedKey>
+  </security></MSM>
+</WLANProfile>
+"@
+    $wifiXmlPath = "$env:TEMP\corp_wifi_profile.xml"
+    try {
+        Set-Content -Path $wifiXmlPath -Value $wifiXml -Encoding UTF8
+        netsh wlan add profile filename="$wifiXmlPath" 2>&1 | Out-Null
+        # add profile writes the profile synchronously; connect can be issued directly.
+        netsh wlan connect name="$WifiSSID" 2>&1 | Out-Null
+        Write-Log 'OK' "WiFi $WifiSSID configured"
+    } finally {
+        # The temp profile holds the WPA2 PSK in plaintext; delete it as soon as netsh imported
+        # it (previously it was left behind, readable, in %TEMP%).
+        Remove-Item -Path $wifiXmlPath -Force -ErrorAction SilentlyContinue
+    }
+} catch {
+    Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
+} } else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
+
+# Map the share
+if ($SharePath) { try {
+    New-SmbMapping -RemotePath $SharePath -UserName $ShareUser -Password $SharePass -Persistent $false -ErrorAction Stop | Out-Null
+    Write-Log 'OK' "Share mapped: $SharePath"
+} catch {
+    Write-Log 'WARN' "Share: $($_.Exception.Message)"
+} } else { Write-Log 'WARN' "Share skipped (SharePath empty)" }
+
+# Background-installer pool. Defined before first use; Ninite starts here (the longest installer)
+# and downloads while PHASE 4-6 run; the rest of the pool joins in PHASE 7. MSI mutex: Ninite and
+# WebAgent never overlap (WebAgent only runs in PHASE 7, after the pool). NOTE: Ninite used to be
+# launched pre-form to overlap form entry; it moved here so nothing mutates before the operator
+# confirms. Stage 2 will re-introduce safe overlap.
+$BgInstalls = [System.Collections.Generic.List[object]]::new()
+function Start-BgInstall {
+    param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0), [string]$WorkingDirectory)
+    $params = @{ FilePath = $FilePath; PassThru = $true }
+    if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
+    # ODT (and any installer that resolves source files relative to CWD) needs a deterministic
+    # working dir; without it Start-Process inherits whatever launched setup.ps1 (system32).
+    if ($WorkingDirectory) { $params['WorkingDirectory'] = $WorkingDirectory }
+    $proc = Start-Process @params
+    $BgInstalls.Add([pscustomobject]@{ Name = $Name; Proc = $proc; OkCodes = $OkCodes })
+    Write-Log 'INFO' "$Name started in the background (PID $($proc.Id))"
+    return $proc
+}
+
+$NinitePath = Join-Path $ScriptDir 'ninite.exe'
+if (Test-Path $NinitePath) {
+    try { Start-BgInstall 'Ninite' $NinitePath | Out-Null }
+    catch { Write-Log 'ERROR' "Ninite: $($_.Exception.Message)" }
+} else {
+    Write-Log 'WARN' "ninite.exe not found on the USB"
+}
 
 # ============================================================
 # PHASE 4 - Rename PC + create user + network + wallpaper
