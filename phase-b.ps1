@@ -17,8 +17,10 @@
 
     It reads its inputs from C:\ProgramData\CorpSetup\state.json, which Phase A
     writes and which NEVER contains credentials. When done it drops a `user-done`
-    flag so the separate SYSTEM cleanup task can finish (disable the bootstrap
-    admin, clear AutoLogon, remove the staging folder).
+    flag so the separate SYSTEM cleanup task can finish (clear the AutoLogon
+    password, unregister the Phase B tasks, remove the staging folder). Cleanup
+    does NOT disable the bootstrap admin - it is the only admin and is kept for
+    support.
 
     The pure helpers (Resolve-SignatureTemplate, Convert-SignatureContent,
     Read-CorpState) have no side effects, so tests dot-source this file with
@@ -298,11 +300,6 @@ function Set-UserDefaultPrinter {
         return
     }
 
-    # Windows 11 manages the default printer (last-used) by default and would
-    # override us; LegacyDefaultPrinterMode = 1 disables that so our choice sticks.
-    $winKey = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows'
-    try { Set-ItemProperty -Path $winKey -Name 'LegacyDefaultPrinterMode' -Value 1 -Type DWord } catch { }
-
     if (-not (Get-Printer -Name $PrinterName -ErrorAction SilentlyContinue)) {
         Write-PhaseLog WARN "Printer '$PrinterName' not found for this user - cannot set default"
         return
@@ -314,6 +311,11 @@ function Set-UserDefaultPrinter {
     $cim = Get-CimInstance -ClassName Win32_Printer -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -eq $PrinterName } | Select-Object -First 1
     if ($cim) {
+        # Only now that we have a printer to set: stop Windows 11 from managing the
+        # default (last-used) so our choice sticks. Doing this before the existence
+        # check would disable management with no corp default to show for it.
+        $winKey = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Windows'
+        try { Set-ItemProperty -Path $winKey -Name 'LegacyDefaultPrinterMode' -Value 1 -Type DWord } catch { }
         Invoke-CimMethod -InputObject $cim -MethodName SetDefaultPrinter | Out-Null
         Write-PhaseLog OK "Default printer set: $PrinterName"
     } else {
