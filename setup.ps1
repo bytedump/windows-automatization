@@ -1496,5 +1496,50 @@ if ($script:ProgUI) {
     try { $script:ProgUI.Runspace.Dispose() } catch { }
 }
 
+# ============================================================
+# PHASE 8 - Phase B handoff: COMMIT (arm AutoLogon + reboot) - only under -EnableHandoff
+# ============================================================
+# Runs AFTER the progress window closed (interactive: technician reviewed the log and clicked Close;
+# headless production: no window, falls straight through). Arm the one-shot AutoLogon and reboot into
+# Phase B. Guarded by HARD preconditions so a half-provisioned box is never armed/rebooted - but NOT
+# by $script:Errors: a failed install must not block Phase B (signature/wallpaper/default-printer are
+# independent of it).
+if ($EnableHandoff) {
+    $StateDir = Join-Path $env:ProgramData 'CorpSetup'
+    $ready =
+        [bool](Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) -and
+        (Test-Path -LiteralPath (Join-Path $StateDir 'state.json')) -and
+        (Test-Path -LiteralPath (Join-Path $StateDir 'phase-b.ps1')) -and
+        (Test-Path -LiteralPath (Join-Path $StateDir 'cleanup.ps1')) -and
+        [bool](Get-ScheduledTask -TaskName 'CorpSetup-PhaseB-User'   -ErrorAction SilentlyContinue) -and
+        [bool](Get-ScheduledTask -TaskName 'CorpSetup-PhaseB-System' -ErrorAction SilentlyContinue)
+    if ($ready) {
+        try {
+            # 🔓 Declared brecha (accepted in the plan): Winlogon AutoLogon stores the password in
+            # PLAINTEXT in HKLM - there is no DPAPI option. One boot only: AutoLogonCount=1 makes
+            # Windows consume + clear it even if cleanup never runs, and cleanup.ps1 (SYSTEM) zeroes
+            # AND verifies it at the end of Phase B. DefaultDomainName='.' = the local machine,
+            # name-independent (the BIOS-serial rename only takes effect on the reboot below).
+            $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            Set-ItemProperty -Path $winlogon -Name 'AutoAdminLogon'    -Value '1'
+            Set-ItemProperty -Path $winlogon -Name 'DefaultUserName'   -Value $Username
+            Set-ItemProperty -Path $winlogon -Name 'DefaultDomainName' -Value '.'
+            Set-ItemProperty -Path $winlogon -Name 'DefaultPassword'   -Value $UserInitialPass
+            Set-ItemProperty -Path $winlogon -Name 'AutoLogonCount'    -Value 1 -Type DWord
+            Write-Log 'OK' 'AutoLogon armed for Phase B (one-shot).'
+            if (-not $NoReboot) {
+                Write-Log 'INFO' 'Rebooting into Phase B...'
+                Restart-Computer -Force
+            }
+        } catch {
+            Write-Log 'ERROR' "Arm AutoLogon / reboot: $($_.Exception.Message)"
+            $exitCode = 1
+        }
+    } else {
+        Write-Log 'ERROR' 'Handoff preconditions not met - NOT arming AutoLogon / NOT rebooting. Finish Phase B manually.'
+        $exitCode = 1
+    }
+}
+
 # Signals failure to the caller (run.bat / FirstLogonCommands check %errorlevel%).
 exit $exitCode
