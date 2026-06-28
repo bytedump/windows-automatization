@@ -242,11 +242,15 @@
            the one that has setup.ps1 AND config.ps1 together (the real payload — avoids
            picking up a stray setup.ps1 on another drive). On first logon the USB may not
            have a letter yet, so it retries for ~60s (30x2s). If not found, it warns with a
-           MessageBox (instead of failing silently). Runs in GUI mode (NO -Unattended). -->
+           MessageBox (instead of failing silently) and exits 2. Runs in GUI mode (NO
+           -Unattended). It captures setup.ps1's exit code (-PassThru) and propagates it
+           (exit $p.ExitCode) so a failed provisioning surfaces to Windows Setup instead of
+           reporting success. Exit contract: 0 = success, 1 = errors tracked, 2 = fatal
+           (guard / config / USB-not-found). -->
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1') -Wait } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Setup USB not found (needs setup.ps1 + config.ps1 at the root). Reconnect the USB and run run.bat manually.','Setup','OK','Error') | Out-Null }"</CommandLine>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ $p=Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1') -Wait -PassThru; exit $p.ExitCode } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Setup USB not found (needs setup.ps1 + config.ps1 at the root). Reconnect the USB and run run.bat manually.','Setup','OK','Error') | Out-Null; exit 2 }"</CommandLine>
           <Description>Post-provisioning: opens setup.ps1 (GUI) from the USB</Description>
           <RequiresUserInput>true</RequiresUserInput>
         </SynchronousCommand>
