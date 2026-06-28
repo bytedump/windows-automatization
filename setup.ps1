@@ -95,6 +95,10 @@ $LogFile      = "$env:USERPROFILE\Desktop\win11_setup_log.txt"
 $ScriptDir    = $PSScriptRoot
 $script:Errors = [System.Collections.Generic.List[string]]::new()
 
+# Absolute path of the wallpaper PHASE 4 copies into %WINDIR% (empty until/unless that runs).
+# Handed to Phase B via state.json. Declared up front so StrictMode never sees it unset.
+$script:WallpaperStaged = ''
+
 # Live-progress UI state. The input form is modal (ShowDialog) on the main thread; the
 # work (PHASE 4-7) runs here on the main thread, while a SEPARATE STA runspace shows a
 # progress window with a real message loop (Application.Run) and a Timer that drains the
@@ -1172,23 +1176,18 @@ try {
     Write-Log 'ERROR' "Network: $($_.Exception.Message)"
 }
 
-# Wallpaper (only if config.ps1 set WallpaperFile - avoids Join-Path with $null under StrictMode)
+# Wallpaper: COPY the image into %WINDIR% so Phase B (per-user, post-reboot) can apply it from a
+# machine-wide path. Applying it live HERE is pointless - this runs as the bootstrap admin, not the
+# new user - so the HKCU apply + SystemParametersInfo refresh moved to phase-b.ps1. (Only if
+# config.ps1 set WallpaperFile - avoids Join-Path with $null under StrictMode.)
 $WallpaperSrc = if ($WallpaperFile) { Join-Path $ScriptDir $WallpaperFile } else { $null }
 if ($WallpaperSrc -and (Test-Path $WallpaperSrc)) {
     try {
         $WallpaperDest = "$env:WINDIR\Web\Wallpaper\Corp"
         New-Item -ItemType Directory -Path $WallpaperDest -Force | Out-Null
         Copy-Item $WallpaperSrc "$WallpaperDest\wallpaper.jpg" -Force
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public class CorpWallpaper {
-    [DllImport("user32.dll", CharSet=CharSet.Auto)]
-    public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-}
-'@
-        [CorpWallpaper]::SystemParametersInfo(20, 0, "$WallpaperDest\wallpaper.jpg", 3) | Out-Null
-        Write-Log 'OK' "Wallpaper applied"
+        $script:WallpaperStaged = "$WallpaperDest\wallpaper.jpg"
+        Write-Log 'OK' "Wallpaper staged: $script:WallpaperStaged"
     } catch {
         Write-Log 'ERROR' "Wallpaper: $($_.Exception.Message)"
     }
@@ -1249,50 +1248,10 @@ if ($SelectedPrinter) {
 
 # WebAgent runs in PHASE 7 - it is msiexec, waits for the pool (Ninite) so they don't collide on the mutex.
 
-# ============================================================
-# PHASE 6 - Outlook signature
-# ============================================================
-Set-Phase 'Phase 6 - Outlook signature'
-
-if ($SectorName -and $SectorName -notmatch '^\(') {
-    try {
-        $sectorPath = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
-
-        if ($SigTemplate -eq '(Automatic - first found)') {
-            $srcFile = Get-ChildItem -Path $sectorPath -Filter '*.htm' -ErrorAction SilentlyContinue |
-                       Where-Object { $_.Name -notmatch '^[._]' } | Select-Object -First 1
-        } else {
-            $srcFile = Get-Item -Path (Join-Path $sectorPath $SigTemplate) -ErrorAction SilentlyContinue
-        }
-
-        if ($srcFile) {
-            $content = [System.IO.File]::ReadAllText($srcFile.FullName, [System.Text.Encoding]::UTF8)
-
-            # Detect the old email
-            $emailMatch = [regex]::Match($content, '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-            $oldEmail   = if ($emailMatch.Success) { $emailMatch.Value } else { '' }
-
-            # Detect the old name in the bold span
-            $nameMatch  = [regex]::Match($content, 'font-weight:\s*bold[^>]*>([^<]+)')
-            $oldName    = if ($nameMatch.Success) { $nameMatch.Groups[1].Value.Trim() } else { '' }
-
-            $newContent = $content
-            if ($oldEmail) { $newContent = $newContent -replace [regex]::Escape($oldEmail), $Email }
-            if ($oldName)  { $newContent = $newContent -replace [regex]::Escape($oldName),  $FullName }
-
-            $sigFolder = "$env:APPDATA\Microsoft\Signatures"
-            New-Item -ItemType Directory -Path $sigFolder -Force | Out-Null
-            [System.IO.File]::WriteAllText("$sigFolder\$Username.htm", $newContent, [System.Text.Encoding]::UTF8)
-
-            Write-Log 'OK' "Signature created: $sigFolder\$Username.htm"
-            Write-Log 'INFO' "Base: $($srcFile.Name) | '$oldName' -> '$FullName' | '$oldEmail' -> '$Email'"
-        } else {
-            Write-Log 'WARN' "No .htm found in: $sectorPath"
-        }
-    } catch { Write-Log 'ERROR' "Signature: $($_.Exception.Message)" }
-} else {
-    Write-Log 'INFO' "Signature skipped"
-}
+# (PHASE 6 - Outlook signature - moved to Phase B (phase-b.ps1). It must land in the NEW user's own
+# %APPDATA%\Microsoft\Signatures after the reboot+AutoLogon, not the bootstrap admin's profile, so it
+# can no longer run here. Phase A only STAGES the template tree under C:\ProgramData\CorpSetup in
+# PHASE 8; phase-b.ps1 reads it and writes the signature as the user.)
 
 # ============================================================
 # PHASE 7 - Join the installers + dependent steps + checklist
@@ -1382,7 +1341,7 @@ PENDING:
 [ ] Confirm Windows activation (slmgr /xpr) - OEM activation is best-effort
 [ ] Register the machine on the intranet
 [ ] Office 365 login: $Email
-[ ] Verify the signature in Outlook
+[ ] Verify the Outlook signature (Phase B applies it on the user's first logon)
 [ ] Test the printer: $(if ($SelectedPrinter) { if ($script:PrinterInstalled) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)] - INSTALL FAILED, add it manually" } } else { 'None' })
 [ ] TOTVS (if requested in the ticket)
 [ ] Hand over credentials: login=$Username / password=(see config.ps1 - do not record in the log)
