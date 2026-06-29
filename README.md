@@ -257,11 +257,18 @@ Automatic bypass via `LabConfig` keys in the `windowsPE` pass. Only these three 
 
 ### Disk guard (fail-closed: exactly 1 disk)
 
-`guard-disk.cmd` counts fixed disks in WinPE (via `diskpart`, since PowerShell/WMIC are
-absent from the default Setup boot image) and is **fail-closed**: it lets the install proceed
-**only** when it confirms *exactly one* fixed disk. On any other outcome — `0` disks parsed
-(diskpart/locale failure), more than one disk, or a diskpart error — it runs `wpeutil shutdown`
-**before** anything is wiped. Disk counting covers EN/pt/es/it/fr/de WinPE languages.
+`guard-disk.cmd` counts **fixed** disks in WinPE and is **fail-closed**: it lets the install
+proceed **only** when it confirms *exactly one* fixed disk. On any other outcome — `0` disks
+parsed, more than one disk, or a tooling error — it runs `wpeutil shutdown` **before** anything
+is wiped. Counting only `MediaType='Fixed hard disk media'` excludes the boot USB itself (a
+*removable* disk) and optical media, so the "exactly 1" check is never tripped by the install
+medium.
+
+WMIC is the primary counter (locale-independent, and it carries the fixed-media filter). The
+Win11 25H2 Setup boot image ships WMIC but **not** `findstr` and **not** PowerShell — an earlier
+`findstr`-based version counted `0` on every machine and aborted every install (caught in VM
+testing). If WMIC is ever absent, the fallback counts disks via `diskpart` + `find`, covering
+EN/pt/es/it/fr/de WinPE languages.
 
 It is wired into `autounattend.xml` as two `RunSynchronous` commands in the
 `Microsoft-Windows-Setup` component, **before** `DiskConfiguration`:
