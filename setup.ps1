@@ -1154,7 +1154,9 @@ try {
     if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
         Write-Log 'OK' "User already exists: $Username"
     } else {
-        New-LocalUser -Name $Username -Password $SecPass -FullName $FullName `
+        # FullName (the display name on the lock screen / Start) = the login (joao.silva), NOT the
+        # title-cased "Joao Silva". The email SIGNATURE still uses the proper full name (via state.json).
+        New-LocalUser -Name $Username -Password $SecPass -FullName $Username `
                       -Description 'Created by setup.ps1' -PasswordNeverExpires:$true -ErrorAction Stop | Out-Null
         Write-Log 'OK' "User created: $Username"
     }
