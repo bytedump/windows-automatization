@@ -1431,18 +1431,25 @@ if ($EnableHandoff) {
 
         # Stage the selected sector's signature subtree (recursive: *.htm + the <template>_files logo
         # folders). phase-b resolves Signatures\<domain>\<sector>\..., so preserve that two-level depth.
-        # Skip when there is no real sector (mirrors phase-b's own '(...)'/empty skip).
+        # Skip when there is no real sector (mirrors phase-b's own '(...)'/empty skip). Isolated in its
+        # OWN try/catch: the signature is the SOFT part (phase-b WARN-skips a missing template), so a
+        # copy failure (locked asset, MAX_PATH on 5.1) must NOT abort the essential task registration
+        # below and brick the whole machine->user handoff.
         if ($SectorName -and $SectorName -notmatch '^\(') {
-            $sigSrc = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
-            if (Test-Path -LiteralPath $sigSrc) {
-                # Copy the sector's CONTENTS into the dest sector folder (not the folder itself), so a
-                # re-run (run.bat) overwrites in place instead of nesting <sector>\<sector>.
-                $sigDest = Join-Path $StateDir (Join-Path 'Signatures' (Join-Path $EmailDomain $SectorName))
-                New-Item -ItemType Directory -Path $sigDest -Force | Out-Null
-                Copy-Item -Path (Join-Path $sigSrc '*') -Destination $sigDest -Recurse -Force
-                Write-Log 'OK' "Signature sector staged: $EmailDomain\$SectorName"
-            } else {
-                Write-Log 'WARN' "Signature source not found (Phase B will skip signature): $sigSrc"
+            try {
+                $sigSrc = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
+                if (Test-Path -LiteralPath $sigSrc) {
+                    # Copy the sector's CONTENTS into the dest sector folder (not the folder itself), so
+                    # a re-run (run.bat) overwrites in place instead of nesting <sector>\<sector>.
+                    $sigDest = Join-Path $StateDir (Join-Path 'Signatures' (Join-Path $EmailDomain $SectorName))
+                    New-Item -ItemType Directory -Path $sigDest -Force | Out-Null
+                    Copy-Item -Path (Join-Path $sigSrc '*') -Destination $sigDest -Recurse -Force
+                    Write-Log 'OK' "Signature sector staged: $EmailDomain\$SectorName"
+                } else {
+                    Write-Log 'WARN' "Signature source not found (Phase B will skip signature): $sigSrc"
+                }
+            } catch {
+                Write-Log 'ERROR' "Signature staging (non-fatal, Phase B will skip): $($_.Exception.Message)"
             }
         }
 
