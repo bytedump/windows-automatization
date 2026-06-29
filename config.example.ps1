@@ -35,6 +35,7 @@ $PathBelarc     = $ScriptDir                        # belarc.exe at the USB root
 $PathEpson      = "$ScriptDir\Drivers Epson"        # folder with .exe drivers
 $PathWebAgent   = "$ScriptDir\20.WebAgent\windows"  # folder with the WebAgent .msi
 $PathSignatures = "$ScriptDir\assinatura-2026"      # structure: \{domain}\{sector}\user.htm
+$PathHBRCloud   = "$ScriptDir\automatizacaoCloud"   # vendor HBR Cloud toolkit (HBRCloud.exe, HBRUpdater.exe, Instalar_HBR.bat, MySql.Data.dll); omit/empty to skip the HBR step
 
 # --- Printers ---
 # printers.json lives at the USB root next to setup.ps1

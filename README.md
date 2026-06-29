@@ -89,7 +89,8 @@ Copy the repo payload **after** Rufus finishes (the steps below write to the USB
 4. **Create `printers.json`** from `printers.example.json` with your real printers.
 5. **Add the binaries / assets** the installers expect (see [USB layout](#-usb-drive-layout)):
    `ninite.exe`, the `Office/` ODT folder (see [Office (ODT)](#office-odt)), `belarc.exe`,
-   `Drivers Epson/`, `20.WebAgent/`, the wallpaper, and the `assinatura-2026/` signature templates.
+   `Drivers Epson/`, `20.WebAgent/`, the wallpaper, the `assinatura-2026/` signature templates,
+   and (optional) the `automatizacaoCloud/` HBR Cloud toolkit.
 6. Plug the USB into the target machine and boot from it — the rest is automatic.
 
 > The bootstrap password you set in step 2 is temporary: `setup.ps1` replaces it on first
@@ -119,6 +120,7 @@ USB Root/
   ├── wallpaper.jpg             ← Wallpaper (filename set in config.ps1 via $WallpaperFile)
   ├── Drivers Epson/            ← Epson driver executables
   ├── 20.WebAgent/windows/      ← WebAgent .msi installer
+  ├── automatizacaoCloud/       ← HBR Cloud toolkit (optional): Instalar_HBR.bat + .ps1, HBRCloud.exe, HBRUpdater.exe, MySql.Data.dll
   └── assinatura-2026/          ← Outlook signature templates (gitignored)
         └── {domain}/
               └── {Sector}/
@@ -352,6 +354,7 @@ $PathBelarc     = $ScriptDir
 $PathEpson      = "$ScriptDir\Drivers Epson"
 $PathWebAgent   = "$ScriptDir\20.WebAgent\windows"
 $PathSignatures = "$ScriptDir\assinatura-2026"  # structure: \{domain}\{sector}\user.htm
+$PathHBRCloud   = "$ScriptDir\automatizacaoCloud" # HBR Cloud toolkit; omit/empty to skip the HBR step
 ```
 
 ### Execution phases
@@ -375,7 +378,8 @@ Phase 5 — Launch the rest of the installers in parallel (Office + Belarc + Eps
           background, no -Wait)
     ↓
 Phase 7 — Join all installers (wait + check exit codes) → add printer (poll for driver) →
-          WebAgent (MSI, after the pool to respect the Windows Installer mutex) →
+          WebAgent (MSI, after the pool to respect the Windows Installer mutex) → HBR Cloud
+          (copy automatizacaoCloud\ to C:\HBR + run its installer bat hands-free) →
           checklist on screen + full log on the Desktop
     ↓
 Phase 8 — Handoff (only with -EnableHandoff): stage C:\ProgramData\CorpSetup (state.json +
@@ -430,6 +434,7 @@ come from `config.ps1`.
 | Belarc Advisor | USB root (`belarc.exe`) | `/S` silent, background |
 | Epson driver | `Drivers Epson\*.exe` | `/S` silent, background + `Add-Printer` via TCP/IP port |
 | WebAgent | `20.WebAgent\windows\` — `.msi` → `.zip` → `.exe` | `msiexec /quiet` or `/S`, after the pool |
+| HBR Cloud | `$PathHBRCloud` (`automatizacaoCloud\`) | Copy folder to `C:\HBR`, then run the vendor `Instalar_HBR.bat` hands-free (empty stdin, hidden); creates the `HBRCloud_Logon` task + Defender exclusions; DB registration is best-effort (corporate network only) |
 
 #### Office (ODT)
 
@@ -486,7 +491,7 @@ values from `state.json`, copies the `<template>_files` logo folder alongside an
 8.  [AUTO] OEM license applied + bootstrap admin password rotated
 9.  [INTERACTIVE] GUI (single window) — technician fills name/domain/network/printer/sector (username auto-derived from the name); the bottom section then streams steps 10-12 live
 10. [AUTO] PC renamed, user created, network configured; wallpaper staged to %WINDIR%
-11. [AUTO] Ninite + Office + Belarc + Epson installed in parallel; WebAgent after
+11. [AUTO] Ninite + Office + Belarc + Epson installed in parallel; WebAgent + HBR Cloud after
 12. [AUTO] Checklist shown + saved to Desktop; Phase B staged (state.json + 2 tasks + new-user AutoLogon armed)
 13. [AUTO] Technician closes the progress window → reboot into Phase B
 14. [AUTO] New user autologons → Phase B applies wallpaper (HKCU) + Outlook signature (default New+Reply) + default printer

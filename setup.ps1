@@ -443,7 +443,8 @@ if (-not $Unattended) {
 # later (e.g. `if ($WifiSSID)` indexes the missing variable and is FATAL under StrictMode).
 # All of these are used under a guard (`if ($Var)`) or validated at the point of use.
 $OptionalConfig = @('WifiSSID', 'WifiPass', 'SharePath', 'ShareUser', 'SharePass',
-                    'WallpaperFile', 'StaticPrefixLength', 'StaticGateway', 'DnsServers')
+                    'WallpaperFile', 'StaticPrefixLength', 'StaticGateway', 'DnsServers',
+                    'PathHBRCloud')
 foreach ($o in $OptionalConfig) {
     if (-not (Get-Variable -Name $o -ErrorAction SilentlyContinue)) {
         New-Variable -Name $o -Value $null
@@ -1366,6 +1367,94 @@ if ($InstallWebAgent) {
     } catch { Write-Log 'ERROR' "WebAgent: $($_.Exception.Message)" }
 }
 
+# ============================================================
+# HBR Cloud - copy the vendor toolkit to C:\HBR and run its installer
+# ============================================================
+# automatizacaoCloud\ ships on the USB. Copy the whole folder to C:\HBR so the machine keeps a
+# local copy of HBRCloud.exe/HBRUpdater.exe + the installer for re-runs, then run the vendor's
+# Instalar_HBR.bat. The bat (-> Instalar_HBR.ps1) registers the machine in the HBR MySQL DB
+# (best-effort), drops the two exes, creates the HBRCloud_Logon scheduled task (-AtLogOn,
+# BUILTIN\Users) and adds Windows Defender exclusions for C:\HBR + both processes.
+#
+# Run the bat FROM THE USB ($PathHBRCloud), not from the C:\HBR copy: the bat passes its own folder
+# as the installer's -PendrivePath (the copy SOURCE). From the USB that source is the pendrive, so
+# the install copies cleanly; from C:\HBR it would copy the exes onto themselves (noisy errors).
+#
+# Hands-free: every branch of the installer ends with Read-Host "Pressione Enter", which on a real
+# console BLOCKS Phase A forever (no human to press Enter). Redirect stdin from an empty file so
+# each Read-Host hits EOF and returns at once; the hidden window then closes on its own.
+# (Start-Process -RedirectStandardInput rejects "NUL" - it resolves it as a relative file path.)
+#
+# SECURITY (declared, vendor-required + pre-authorized): the installer adds Defender exclusions for
+# C:\HBR + HBRCloud.exe/HBRUpdater.exe. Logged below as a conscious action.
+if ($PathHBRCloud) {
+    Set-Phase 'Phase 7 - HBR Cloud install'
+    $hbrBat = Join-Path $PathHBRCloud 'Instalar_HBR.bat'
+    if (Test-Path $hbrBat) {
+        try {
+            New-Item -ItemType Directory -Path 'C:\HBR' -Force | Out-Null
+            # Best-effort local retention only: the install itself runs from the USB ($PathHBRCloud)
+            # and the vendor re-copies the exes (ETAPA 3), so this copy is NOT a prerequisite. A
+            # locked/in-use file on a re-run (HBRCloud.exe is launched at logon by the task the
+            # installer registers) must not abort the step -> keep it in its own try/catch -> WARN.
+            try {
+                Copy-Item -Path (Join-Path $PathHBRCloud '*') -Destination 'C:\HBR' -Recurse -Force
+                Write-Log 'OK' 'HBR toolkit copied to C:\HBR'
+            } catch {
+                Write-Log 'WARN' "HBR: local retention copy skipped (likely an in-use file on re-run): $($_.Exception.Message)"
+            }
+            Write-Log 'INFO' 'HBR: installer adds Defender exclusions for C:\HBR + HBRCloud/HBRUpdater (vendor-required, declared)'
+
+            # Empty stdin -> the installer's Read-Host calls return at once (never block Phase A).
+            $hbrStdin = Join-Path $env:TEMP 'hbr_stdin.txt'
+            Set-Content -LiteralPath $hbrStdin -Value $null
+            $hbrOut = Join-Path $env:TEMP 'hbr_out.txt'
+            $hbrErr = Join-Path $env:TEMP 'hbr_err.txt'
+
+            $proc = Start-Process cmd.exe -PassThru -WindowStyle Hidden `
+                -ArgumentList @('/c', "`"$hbrBat`"") `
+                -RedirectStandardInput  $hbrStdin `
+                -RedirectStandardOutput $hbrOut `
+                -RedirectStandardError  $hbrErr
+            # Cache the handle BEFORE exit, else .ExitCode reads blank when stdio is redirected.
+            $null = $proc.Handle
+            $hbrExited = $proc.WaitForExit(300 * 1000)
+            if (-not $hbrExited) {
+                # Tree-kill: $proc is cmd.exe, which spawned the bat -> powershell grandchild doing
+                # the actual install. Bare Kill() on PS 5.1 only kills cmd.exe and orphans the
+                # grandchild (it keeps mutating the machine + holds the stdout/stderr handles open).
+                # taskkill /T terminates the whole tree; WaitForExit() then lets the handles release
+                # before we read/delete the capture files.
+                try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+                try { $proc.WaitForExit() } catch { }
+            }
+            # Fold the installer's own progress (its 6 numbered steps) into our log - on BOTH the
+            # normal and the timeout path, so a hung install still leaves diagnostics behind.
+            foreach ($f in @($hbrOut, $hbrErr)) {
+                if (Test-Path $f) {
+                    Get-Content -LiteralPath $f -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -and $_.Trim() } |
+                        ForEach-Object { Write-Log 'INFO' "HBR| $($_.Trim())" }
+                }
+            }
+            if (-not $hbrExited) {
+                Write-Log 'ERROR' 'HBR installer timed out after 300s - tree killed'
+            } elseif ($proc.ExitCode -eq 0) {
+                Write-Log 'OK' 'HBR Cloud installed (C:\HBR + HBRCloud_Logon task + Defender). DB registration is best-effort (off-network = skipped).'
+            } else {
+                Write-Log 'WARN' "HBR installer exit $($proc.ExitCode) - review the HBR| lines above"
+            }
+            Remove-Item -LiteralPath $hbrStdin, $hbrOut, $hbrErr -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log 'ERROR' "HBR Cloud install: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log 'WARN' "HBR installer not found at $hbrBat - skipping HBR Cloud step"
+    }
+} else {
+    Write-Log 'INFO' 'HBR Cloud step skipped (PathHBRCloud not set in config.ps1)'
+}
+
 $checklist = @"
 
 ========================================
@@ -1384,6 +1473,7 @@ PENDING:
 [ ] Verify the Outlook signature (Phase B applies it on the user's first logon)
 [ ] Test the printer: $(if ($SelectedPrinter) { if ($script:PrinterInstalled) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)] - INSTALL FAILED, add it manually" } } else { 'None' })
 [ ] TOTVS (if requested in the ticket)
+[ ] HBR Cloud: confirm C:\HBR + the HBRCloud_Logon task (DB registration happens only on the corporate network)
 [ ] Hand over credentials: login=$Username / password=(see config.ps1 - do not record in the log)
 ========================================
 Log: $LogFile
