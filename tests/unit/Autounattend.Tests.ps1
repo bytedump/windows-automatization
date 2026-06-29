@@ -22,4 +22,8 @@ Describe 'autounattend.template.xml' {
     It 'exits non-zero (2) when the setup USB is not found' {
         $Raw | Should -Match 'Out-Null; exit 2'
     }
+
+    It 'passes -EnableHandoff to setup.ps1 (two-phase handoff is live)' {
+        $Raw | Should -Match "'setup\.ps1'\),'-EnableHandoff'"
+    }
 }
