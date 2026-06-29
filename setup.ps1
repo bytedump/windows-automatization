@@ -1261,7 +1261,10 @@ try {
 
 # Belarc (pool) - EXE /S
 try {
-    $belarc = Get-ChildItem -Path $PathBelarc -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    # Match by name (belarc*.exe), NOT the first *.exe: the USB root also holds the Windows
+    # installer's setup.exe, and a broad *.exe filter would launch the Win11 setup (modal,
+    # freezes Phase A) instead of Belarc. See config: $PathBelarc = USB root.
+    $belarc = Get-ChildItem -Path $PathBelarc -Filter 'belarc*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($belarc) { Start-BgInstall 'Belarc' $belarc.FullName @('/S') | Out-Null }
     else { Write-Log 'WARN' "Belarc installer not found in $PathBelarc" }
 } catch { Write-Log 'ERROR' "Belarc: $($_.Exception.Message)" }
