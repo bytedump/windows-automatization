@@ -183,3 +183,87 @@ Describe 'Read-CorpState' {
         { Read-CorpState -Path $stateFile } | Should -Throw '*missing required field: FullName*'
     }
 }
+
+# Install-UserSignature is a side-effecting step, but its file pipeline (resolve template ->
+# rewrite name/email -> copy the <base>_files assets -> repoint refs -> write into the user's
+# %APPDATA%) is the glue the pure-function tests above do not cover end-to-end. We exercise it
+# with $env:APPDATA redirected to TestDrive and Set-DefaultSignature mocked, so no real registry
+# (HKCU/HKLM) is touched - only the user-profile file writes, which are the point of the test.
+Describe 'Install-UserSignature (file pipeline)' {
+    BeforeAll { $script:origAppData = $env:APPDATA }
+    AfterAll  { $env:APPDATA = $script:origAppData }
+
+    BeforeEach {
+        # Redirect the user profile so the signature lands under TestDrive, not the real %APPDATA%.
+        # TestDrive persists across Its - wipe it so each case starts with no signature folder.
+        $script:appData = Join-Path $TestDrive 'AppData\Roaming'
+        Remove-Item -LiteralPath $appData -Recurse -Force -ErrorAction SilentlyContinue
+        $env:APPDATA = $appData
+        $script:sigOut = Join-Path $appData 'Microsoft\Signatures'
+
+        # Staged signature tree (what Phase A copies): <root>\<domain>\<sector>\<template>.htm
+        # plus the sibling <template>_files asset folder.
+        $script:root   = Join-Path $TestDrive 'Signatures'
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        $script:sector = Join-Path $root 'corp.com\Sales'
+        New-Item -ItemType Directory -Path $sector -Force | Out-Null
+
+        # Default-signature registration is out of scope here (it mutates HKCU/HKLM).
+        Mock -CommandName Set-DefaultSignature -MockWith { }
+    }
+
+    It 'writes the rewritten .htm into %APPDATA% and copies + repoints the _files assets' {
+        Set-Content -LiteralPath (Join-Path $sector 'team.htm') -Encoding UTF8 -Value @'
+<p><span style="font-weight: bold">Old Name</span><br>old.name@corp.com</p>
+<img src="team_files/logo.png">
+'@
+        $assets = Join-Path $sector 'team_files'
+        New-Item -ItemType Directory -Path $assets -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $assets 'logo.png') -Value 'PNGDATA' -Encoding UTF8
+
+        $state = [pscustomobject]@{
+            Username = 'joao.silva'; FullName = 'Joao Silva'; Email = 'joao.silva@corp.com'
+            EmailDomain = 'corp.com'; SectorName = 'Sales'; SigTemplate = '(Automatic - first found)'
+            PrinterName = ''; WallpaperPath = ''
+        }
+
+        Install-UserSignature -State $state -SignaturesRoot $root
+
+        $htm = Join-Path $sigOut 'joao.silva.htm'
+        Test-Path -LiteralPath $htm | Should -BeTrue
+        $written = Get-Content -LiteralPath $htm -Raw
+        $written | Should -Match 'Joao Silva'
+        $written | Should -Match 'joao\.silva@corp\.com'
+        $written | Should -Not -Match 'Old Name'
+        $written | Should -Not -Match 'old\.name@corp\.com'
+
+        # Assets copied to <Username>_files and the reference repointed away from <template>_files.
+        Test-Path -LiteralPath (Join-Path $sigOut 'joao.silva_files\logo.png') | Should -BeTrue
+        $written | Should -Match ([regex]::Escape('joao.silva_files/logo.png'))
+        $written | Should -Not -Match 'team_files'
+
+        Should -Invoke -CommandName Set-DefaultSignature -Times 1 -Exactly
+    }
+
+    It 'skips (no file, no throw) when the sector is the no-signature sentinel' {
+        $state = [pscustomobject]@{
+            Username = 'joao.silva'; FullName = 'Joao Silva'; Email = 'joao.silva@corp.com'
+            EmailDomain = 'corp.com'; SectorName = '(Nenhum)'; SigTemplate = ''
+            PrinterName = ''; WallpaperPath = ''
+        }
+        { Install-UserSignature -State $state -SignaturesRoot $root } | Should -Not -Throw
+        Test-Path -LiteralPath $sigOut | Should -BeFalse
+        Should -Invoke -CommandName Set-DefaultSignature -Times 0 -Exactly
+    }
+
+    It 'warns (no file, no throw) when no template exists under the sector' {
+        $state = [pscustomobject]@{
+            Username = 'joao.silva'; FullName = 'Joao Silva'; Email = 'joao.silva@corp.com'
+            EmailDomain = 'corp.com'; SectorName = 'Sales'; SigTemplate = '(Automatic - first found)'
+            PrinterName = ''; WallpaperPath = ''
+        }
+        { Install-UserSignature -State $state -SignaturesRoot $root } | Should -Not -Throw
+        Test-Path -LiteralPath (Join-Path $sigOut 'joao.silva.htm') | Should -BeFalse
+        Should -Invoke -CommandName Set-DefaultSignature -Times 0 -Exactly
+    }
+}
