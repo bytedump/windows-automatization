@@ -92,11 +92,37 @@ function Test-UserDoneFlag {
     return (Test-Path -LiteralPath (Join-Path $StateDir 'user-done'))
 }
 
-# Remove the staging folder. Idempotent: a no-op (returns $false) when already gone.
+# Recursively delete a tree WITHOUT following directory reparse points (junctions / symlinks).
+# The staging folder is user-writable (inherited ProgramData ACL), so a standard user can plant a
+# directory junction in it; Windows PowerShell 5.1 `Remove-Item -Recurse` traverses INTO junctions
+# and would delete the TARGET's contents - a SYSTEM arbitrary-delete (this runs as the SYSTEM task).
+# So first unlink every reparse-point directory (the walk skips them, never descends a link), then
+# the now link-free tree is safe to remove recursively.
+function Remove-TreeNoReparse {
+    param([Parameter(Mandatory)][string]$Path)
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push($Path)
+    $reparse = [System.Collections.Generic.List[string]]::new()
+    while ($stack.Count) {
+        $dir = $stack.Pop()
+        foreach ($child in [System.IO.Directory]::GetDirectories($dir)) {
+            if ([System.IO.File]::GetAttributes($child) -band [System.IO.FileAttributes]::ReparsePoint) {
+                $reparse.Add($child)              # junction/symlink: unlink, never descend into it
+            } else {
+                $stack.Push($child)
+            }
+        }
+    }
+    foreach ($r in $reparse) { [System.IO.Directory]::Delete($r, $false) }   # remove the link only
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
+# Remove the staging folder. Idempotent: a no-op (returns $false) when already gone. Junction-safe
+# (see Remove-TreeNoReparse) - the staging tree is user-writable and this deletes it as SYSTEM.
 function Remove-StagingFolder {
     param([Parameter(Mandatory)][string]$StateDir)
     if (Test-Path -LiteralPath $StateDir) {
-        Remove-Item -LiteralPath $StateDir -Recurse -Force -ErrorAction Stop
+        Remove-TreeNoReparse -Path $StateDir
         return $true
     }
     return $false
@@ -115,7 +141,12 @@ function Save-PhaseBLogs {
     try {
         $dest = Join-Path $DestRoot 'corp-phaseb-logs'
         New-Item -ItemType Directory -Path $dest -Force | Out-Null
-        Copy-Item -LiteralPath $src -Destination $dest -Recurse -Force
+        # Copy ONLY the flat *.log files Phase B writes - never -Recurse. The logs folder is
+        # user-writable, so a recursive copy as SYSTEM would follow a planted directory junction and
+        # read its target; -File excludes any reparse-point directory outright.
+        $logs = @(Get-ChildItem -LiteralPath $src -File -Filter '*.log' -ErrorAction SilentlyContinue)
+        if (-not $logs) { return $false }
+        foreach ($f in $logs) { Copy-Item -LiteralPath $f.FullName -Destination $dest -Force }
         Write-CleanupLog OK "Phase B logs preserved -> $dest"
         return $true
     } catch {

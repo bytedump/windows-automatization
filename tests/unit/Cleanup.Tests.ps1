@@ -45,6 +45,25 @@ Describe 'Remove-StagingFolder' {
         $d = Join-Path $TestDrive 'staging2'
         Remove-StagingFolder -StateDir $d | Should -BeFalse
     }
+
+    It 'does NOT follow a planted directory junction (SYSTEM arbitrary-delete guard)' {
+        # A standard user can plant a junction in the user-writable staging tree; the SYSTEM cleanup
+        # must unlink it, NOT delete through it into the target.
+        $target = Join-Path $TestDrive 'precious'
+        New-Item -ItemType Directory -Path $target -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $target 'keep.txt') -Value 'KEEP' -Encoding UTF8
+
+        $staging = Join-Path $TestDrive 'stagingJ'
+        New-Item -ItemType Directory -Path (Join-Path $staging 'logs') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $staging 'user-done') -Value 'x' -Encoding UTF8
+        New-Item -ItemType Junction -Path (Join-Path $staging 'evil') -Target $target | Out-Null
+        New-Item -ItemType Junction -Path (Join-Path $staging 'logs\nested') -Target $target | Out-Null
+
+        Remove-StagingFolder -StateDir $staging | Should -BeTrue
+        Test-Path -LiteralPath $staging | Should -BeFalse
+        # The junction TARGET and its contents must survive the SYSTEM-context delete.
+        Test-Path -LiteralPath (Join-Path $target 'keep.txt') | Should -BeTrue
+    }
 }
 
 Describe 'Save-PhaseBLogs' {
@@ -54,7 +73,8 @@ Describe 'Save-PhaseBLogs' {
         Set-Content -LiteralPath (Join-Path $sd 'logs\phase-b-joao.log') -Value 'log' -Encoding UTF8
         $destRoot = Join-Path $TestDrive 'destroot1'
         Save-PhaseBLogs -StateDir $sd -DestRoot $destRoot | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $destRoot 'corp-phaseb-logs\logs\phase-b-joao.log') | Should -BeTrue
+        # Flat copy of *.log (no -Recurse, junction-safe) -> file lands directly under corp-phaseb-logs.
+        Test-Path -LiteralPath (Join-Path $destRoot 'corp-phaseb-logs\phase-b-joao.log') | Should -BeTrue
     }
 
     It 'returns $false (no-op) when there is no logs folder' {
