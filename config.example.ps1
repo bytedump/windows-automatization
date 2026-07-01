@@ -12,11 +12,6 @@ $UserInitialPass = "USER_INITIAL_PASSWORD"      # initial password for created u
 # --- Email domains (GUI dropdown) ---
 $EmailDomains = @('empresa.com.br', 'empresa.org.br')  # add/remove as needed
 
-# --- Corporate network (share) ---
-$SharePath   = "\\SERVER_IP\share"              # e.g. \\10.0.1.1\technology.group
-$ShareUser   = "USERNAME"                        # e.g. share_user
-$SharePass   = "SHARE_PASSWORD"                  # share access password
-
 # --- Static IP (used when the technician picks "Static IP" in the GUI) ---
 $StaticGateway      = "GATEWAY_IP"               # e.g. 192.168.1.1
 $StaticPrefixLength = 24                          # mask: 24=/24 . 22=/22 . 16=/16
@@ -36,6 +31,15 @@ $PathEpson      = "$ScriptDir\Drivers Epson"        # folder with .exe drivers
 $PathWebAgent   = "$ScriptDir\20.WebAgent\windows"  # folder with the WebAgent .msi
 $PathSignatures = "$ScriptDir\assinatura-2026"      # structure: \{domain}\{sector}\user.htm
 $PathHBRCloud   = "$ScriptDir\automatizacaoCloud"   # vendor HBR Cloud toolkit (HBRCloud.exe, HBRUpdater.exe, Instalar_HBR.bat, MySql.Data.dll); omit/empty to skip the HBR step
+$PathVPN        = "$ScriptDir\VPN"                  # OpenVPN: folder with the .msi installer + the .ovpn profile; omit/empty to disable the VPN option in the GUI
+
+# --- Corporate browser bookmarks (Chrome / Edge / Firefox) ---
+# Pushed to the bookmarks bar via enterprise policy when the "corp bookmarks" box is ticked in the
+# GUI. Real URLs live in config.ps1 on the USB (this repo is public - keep internal IPs out here).
+$Bookmarks = @(
+    @{ Name = 'App1'; Url = 'https://app1.example.com/' },
+    @{ Name = 'App2'; Url = 'https://10.0.0.1:1234/webapp/' }
+)
 
 # --- Printers ---
 # printers.json lives at the USB root next to setup.ps1

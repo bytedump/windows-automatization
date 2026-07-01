@@ -11,11 +11,6 @@ $UserInitialPass = "Test@Sandbox2024!"
 # --- Domains available in the form ---
 $EmailDomains = @('empresa.com.br')
 
-# --- Share (does not exist — setup.ps1 will log WARN and continue) ---
-$SharePath   = ""
-$ShareUser   = ""
-$SharePass   = ""
-
 # --- Static IP ---
 $StaticGateway      = "192.168.1.1"
 $StaticPrefixLength = 24

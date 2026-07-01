@@ -8,6 +8,8 @@ param(
     [switch]$TestStaticIp,
     [string]$TestIpAddress = '',
     [switch]$TestWebAgent,
+    [switch]$TestVpn,
+    [switch]$TestBookmarks,
     # Two-phase handoff (PHASE 8). OFF by default so the harness (interactive sandbox + -Headless)
     # and any single-phase run behave as before - they never stage, arm AutoLogon, or reboot.
     # Production turns it on via autounattend (task 3e). -EnableHandoff: stage Phase B + register the
@@ -113,6 +115,34 @@ function New-CorpStateObject {
         SigTemplate   = $SigTemplate
         PrinterName   = $PrinterName
         WallpaperPath = $WallpaperPath
+    }
+}
+
+# Build the enterprise-policy bookmark payloads for Chrome/Edge (ManagedBookmarks / ManagedFavorites
+# JSON) and Firefox (distribution\policies.json). PURE: returns the JSON strings and writes nothing,
+# so it sits above the -LoadOnly seam and the unit tests assert the payload shape without touching
+# the registry or the filesystem. $Bookmarks is an array of @{ Name = '...'; Url = '...' }; Phase A
+# does the actual writes. ConvertTo-Json runs per item and the array is joined by hand because PS
+# 5.1's ConvertTo-Json collapses a single-element array into a bare object.
+function ConvertTo-BrowserBookmarkPolicy {
+    param([Parameter(Mandatory)][object[]]$Bookmarks)
+
+    # Chrome ManagedBookmarks and Edge ManagedFavorites share the exact same [{name,url},...] shape.
+    $chromiumItems = foreach ($b in $Bookmarks) {
+        [pscustomobject]@{ name = [string]$b.Name; url = [string]$b.Url } | ConvertTo-Json -Compress
+    }
+    $chromiumJson = '[' + ($chromiumItems -join ',') + ']'
+
+    # Firefox has no bookmark registry policy; it reads a policies.json. Placement 'toolbar' pins the
+    # link to the bookmarks toolbar (visible without opening a folder).
+    $firefoxItems = foreach ($b in $Bookmarks) {
+        [pscustomobject]@{ Title = [string]$b.Name; URL = [string]$b.Url; Placement = 'toolbar' } | ConvertTo-Json -Compress
+    }
+    $firefoxJson = '{"policies":{"Bookmarks":[' + ($firefoxItems -join ',') + ']}}'
+
+    return [pscustomobject]@{
+        ChromiumJson = $chromiumJson   # Chrome ManagedBookmarks + Edge ManagedFavorites (same value)
+        FirefoxJson  = $firefoxJson
     }
 }
 
@@ -442,9 +472,9 @@ if (-not $Unattended) {
 # OPTIONAL config: if config.ps1 omits it, create it as $null so StrictMode does not blow up
 # later (e.g. `if ($WifiSSID)` indexes the missing variable and is FATAL under StrictMode).
 # All of these are used under a guard (`if ($Var)`) or validated at the point of use.
-$OptionalConfig = @('WifiSSID', 'WifiPass', 'SharePath', 'ShareUser', 'SharePass',
+$OptionalConfig = @('WifiSSID', 'WifiPass',
                     'WallpaperFile', 'StaticPrefixLength', 'StaticGateway', 'DnsServers',
-                    'PathHBRCloud')
+                    'PathHBRCloud', 'PathVPN', 'Bookmarks')
 foreach ($o in $OptionalConfig) {
     if (-not (Get-Variable -Name $o -ErrorAction SilentlyContinue)) {
         New-Variable -Name $o -Value $null
@@ -454,7 +484,7 @@ foreach ($o in $OptionalConfig) {
 # ============================================================
 # Pre-form data load (reads only - NO machine mutation here)
 # ============================================================
-# OEM activation, admin-password rotation, WiFi, share mapping and the Ninite launch used to run
+# OEM activation, admin-password rotation, WiFi and the Ninite launch used to run
 # HERE, before the form. They mutate the machine, so they moved into PHASE A (below), which only
 # runs after the operator confirms - a Cancel must change nothing. The one thing still needed
 # before the form is the read-only data the form renders (printers).
@@ -776,7 +806,7 @@ $TxtIp.Add_TextChanged({
 $y += 92 + 12
 
 # --- group: Peripherals and applications ---
-$gPer = New-Group 'Peripherals and applications' $gx $y $gw 118
+$gPer = New-Group 'Peripherals and applications' $gx $y $gw 178
 $py = 28
 $CmbPrinter = New-Combo
 # DropDownList (New-Combo default), same UX as the signature combos below: click the bar or
@@ -791,7 +821,19 @@ $ChkWebAgent.AutoSize = $true
 $ChkWebAgent.Location = New-Object System.Drawing.Point(16, $py)
 $Tip.SetToolTip($ChkWebAgent, 'Downloads and installs the WebAgent required to access TOTVS on this machine.')
 $gPer.Controls.Add($ChkWebAgent)
-$y += 118 + 12
+$ChkVpn          = New-Object System.Windows.Forms.CheckBox
+$ChkVpn.Text     = 'Will this PC use the VPN? (installs OpenVPN + imports the profile)'
+$ChkVpn.AutoSize = $true
+$ChkVpn.Location = New-Object System.Drawing.Point(16, ($py + 26))
+$Tip.SetToolTip($ChkVpn, 'Installs OpenVPN and imports the corp profile into this user. You still connect manually (user/password).')
+$gPer.Controls.Add($ChkVpn)
+$ChkBookmarks          = New-Object System.Windows.Forms.CheckBox
+$ChkBookmarks.Text     = 'Add corp bookmarks (Cavok + TOTVS) to Chrome/Edge/Firefox'
+$ChkBookmarks.AutoSize = $true
+$ChkBookmarks.Location = New-Object System.Drawing.Point(16, ($py + 52))
+$Tip.SetToolTip($ChkBookmarks, 'Pins the corp links to the bookmarks bar of Chrome, Edge and Firefox via enterprise policy (managed - users cannot remove them). URLs come from $Bookmarks in config.ps1.')
+$gPer.Controls.Add($ChkBookmarks)
+$y += 178 + 12
 
 # --- group: Email signature ---
 $gSig = New-Group 'Email signature' $gx $y $gw 140
@@ -928,6 +970,8 @@ $SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { 
 $SectorName      = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
 $SigTemplate     = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
 $InstallWebAgent = $ChkWebAgent.Checked
+$InstallVpn      = $ChkVpn.Checked
+$InstallBookmarks = $ChkBookmarks.Checked
 
 } catch {
     Write-Log 'FATAL' "Input GUI failed: $($_.Exception.Message)"
@@ -956,6 +1000,8 @@ $InstallWebAgent = $ChkWebAgent.Checked
 
     $SigTemplate     = '(Automatic - first found)'
     $InstallWebAgent = $TestWebAgent.IsPresent
+    $InstallVpn      = $TestVpn.IsPresent
+    $InstallBookmarks = $TestBookmarks.IsPresent
 }
 
 # Final defensive validation - the single point both paths (GUI + headless -Test*) converge on.
@@ -1096,7 +1142,7 @@ if ($WifiSSID) { try {
 # and downloads while PHASE 4-6 run; the rest of the pool joins in PHASE 7. MSI mutex: Ninite and
 # WebAgent never overlap (WebAgent only runs in PHASE 7, after the pool). NOTE: Ninite used to be
 # launched pre-form to overlap form entry; it moved here so nothing mutates before the operator
-# confirms. Stage 2 will re-introduce safe overlap.
+# confirms.
 $BgInstalls = [System.Collections.Generic.List[object]]::new()
 function Start-BgInstall {
     param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0), [string]$WorkingDirectory)
@@ -1367,6 +1413,62 @@ if ($InstallWebAgent) {
     } catch { Write-Log 'ERROR' "WebAgent: $($_.Exception.Message)" }
 }
 
+# VPN (OpenVPN) - install the MSI machine-wide (needs admin, so it runs here in Phase A). The
+# per-user profile import happens in Phase B (it must land in the CREATED user's profile, not the
+# setup admin's). Gated by the GUI checkbox / -TestVpn.
+if ($InstallVpn) {
+    try {
+        if ($PathVPN -and (Test-Path $PathVPN)) {
+            $vpnMsi = Get-ChildItem -Path $PathVPN -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vpnMsi) {
+                Write-Log 'INFO' "OpenVPN MSI: $($vpnMsi.Name)"
+                $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($vpnMsi.FullName)`"", '/quiet', '/norestart')
+                if ($p) { Write-ProcResult 'OpenVPN (MSI)' $p @(0, 3010) }
+            } else {
+                Write-Log 'WARN' "OpenVPN installer (.msi) not found in $PathVPN"
+            }
+        } else {
+            Write-Log 'WARN' 'VPN selected but PathVPN is not set/found - skipping OpenVPN install'
+        }
+    } catch { Write-Log 'ERROR' "OpenVPN: $($_.Exception.Message)" }
+}
+
+# Corp bookmarks - push the corp links (Cavok + TOTVS) to Chrome/Edge/Firefox via enterprise policy
+# so they show on the bookmarks bar before the user's first launch. The HKLM policy keys and
+# Firefox's distribution\policies.json all need admin, so this runs machine-wide here in Phase A (no
+# per-user step, unlike the VPN). Gated by the GUI checkbox / -TestBookmarks; the URLs come from
+# $Bookmarks in config.ps1 (kept out of this public repo). Each browser is best-effort - a failure
+# logs and the others still apply. Chrome/Edge policy keys are harmless if the browser is absent
+# (read only when it launches); Firefox needs its install dir, so it is probed first.
+if ($InstallBookmarks) {
+    if ($Bookmarks) {
+        try {
+            $bm = ConvertTo-BrowserBookmarkPolicy -Bookmarks $Bookmarks
+
+            $chromeKey = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
+            New-Item -Path $chromeKey -Force | Out-Null
+            Set-ItemProperty -Path $chromeKey -Name 'ManagedBookmarks' -Value $bm.ChromiumJson
+            $edgeKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+            New-Item -Path $edgeKey -Force | Out-Null
+            Set-ItemProperty -Path $edgeKey -Name 'ManagedFavorites' -Value $bm.ChromiumJson
+            Write-Log 'OK' 'Corp bookmarks: Chrome + Edge policy set'
+
+            $ffDir = @("$env:ProgramFiles\Mozilla Firefox", "${env:ProgramFiles(x86)}\Mozilla Firefox") |
+                     Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if ($ffDir) {
+                $ffDist = Join-Path $ffDir 'distribution'
+                New-Item -ItemType Directory -Path $ffDist -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $ffDist 'policies.json') -Value $bm.FirefoxJson -Encoding UTF8
+                Write-Log 'OK' 'Corp bookmarks: Firefox policies.json written'
+            } else {
+                Write-Log 'WARN' 'Corp bookmarks: Firefox not installed - skipped'
+            }
+        } catch { Write-Log 'ERROR' "Corp bookmarks: $($_.Exception.Message)" }
+    } else {
+        Write-Log 'WARN' 'Bookmarks selected but $Bookmarks is empty in config - skipping'
+    }
+}
+
 # ============================================================
 # HBR Cloud - copy the vendor toolkit to C:\HBR and run its installer
 # ============================================================
@@ -1545,6 +1647,25 @@ if ($EnableHandoff) {
                 }
             } catch {
                 Write-Log 'ERROR' "Signature staging (non-fatal, Phase B will skip): $($_.Exception.Message)"
+            }
+        }
+
+        # Stage the VPN profile (.ovpn) for Phase B, only if the tech selected VPN. Phase B (running
+        # AS the new user) imports it into %USERPROFILE%\OpenVPN\config. Own try/catch: like the
+        # signature, a copy failure must not abort the task registration below and brick the handoff.
+        if ($InstallVpn -and $PathVPN -and (Test-Path $PathVPN)) {
+            try {
+                $ovpnSrc = Get-ChildItem -Path $PathVPN -Filter '*.ovpn' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($ovpnSrc) {
+                    $vpnDest = Join-Path $StateDir 'VPN'
+                    New-Item -ItemType Directory -Path $vpnDest -Force | Out-Null
+                    Copy-Item -LiteralPath $ovpnSrc.FullName -Destination (Join-Path $vpnDest $ovpnSrc.Name) -Force
+                    Write-Log 'OK' "VPN profile staged: $($ovpnSrc.Name)"
+                } else {
+                    Write-Log 'WARN' "VPN selected but no .ovpn found in $PathVPN (Phase B will skip)"
+                }
+            } catch {
+                Write-Log 'ERROR' "VPN staging (non-fatal, Phase B will skip): $($_.Exception.Message)"
             }
         }
 

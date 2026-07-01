@@ -267,3 +267,38 @@ Describe 'Install-UserSignature (file pipeline)' {
         Should -Invoke -CommandName Set-DefaultSignature -Times 0 -Exactly
     }
 }
+
+# Install-UserVpnProfile is side-effecting, but its core (find the staged .ovpn -> copy it into the
+# user's OpenVPN config dir, or skip cleanly when VPN was not selected) is worth covering. -ConfigDir
+# points at TestDrive and -GuiPath at a path that does NOT exist, so the OpenVPN-GUI autostart/launch
+# branch (HKCU + Start-Process) never fires - only the profile copy, which is the point of the test.
+Describe 'Install-UserVpnProfile (profile import)' {
+    BeforeEach {
+        $script:staging = Join-Path $TestDrive 'VPN'
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        $script:cfgDir  = Join-Path $TestDrive 'UserProfile\OpenVPN\config'
+        Remove-Item -LiteralPath $cfgDir -Recurse -Force -ErrorAction SilentlyContinue
+        $script:noGui   = Join-Path $TestDrive 'nope\openvpn-gui.exe'
+    }
+
+    It 'imports the staged .ovpn into the user config dir' {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $staging 'Servidor-OpenVPN.ovpn') -Value 'client' -Encoding UTF8
+
+        Install-UserVpnProfile -StagingRoot $staging -ConfigDir $cfgDir -GuiPath $noGui
+
+        Test-Path -LiteralPath (Join-Path $cfgDir 'Servidor-OpenVPN.ovpn') | Should -BeTrue
+    }
+
+    It 'skips (no throw, no copy) when nothing was staged (VPN not selected)' {
+        { Install-UserVpnProfile -StagingRoot $staging -ConfigDir $cfgDir -GuiPath $noGui } | Should -Not -Throw
+        Test-Path -LiteralPath $cfgDir | Should -BeFalse
+    }
+
+    It 'skips (no throw) when the staging folder exists but holds no .ovpn' {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $staging 'readme.txt') -Value 'x' -Encoding UTF8
+        { Install-UserVpnProfile -StagingRoot $staging -ConfigDir $cfgDir -GuiPath $noGui } | Should -Not -Throw
+        Test-Path -LiteralPath $cfgDir | Should -BeFalse
+    }
+}

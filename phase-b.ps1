@@ -323,6 +323,45 @@ function Set-UserDefaultPrinter {
     }
 }
 
+# Import the corp VPN profile for THIS user, if Phase A staged one (it stages the .ovpn only when
+# the technician ticked the VPN box). The profile carries an embedded client key, so it lands in
+# the user's OWN profile (%USERPROFILE%\OpenVPN\config), not a machine-wide dir. If OpenVPN is
+# installed, register its GUI to open at logon and launch it now so the tray icon is ready - the
+# profile uses auth-user-pass, so the user still connects manually (types user/password).
+function Install-UserVpnProfile {
+    param(
+        [Parameter(Mandatory)][string]$StagingRoot,
+        [string]$ConfigDir = (Join-Path $env:USERPROFILE 'OpenVPN\config'),
+        [string]$GuiPath   = (Join-Path $env:ProgramFiles 'OpenVPN\bin\openvpn-gui.exe')
+    )
+    if (-not (Test-Path -LiteralPath $StagingRoot)) {
+        Write-PhaseLog INFO 'VPN skipped (not selected)'
+        return
+    }
+    $ovpn = Get-ChildItem -LiteralPath $StagingRoot -Filter '*.ovpn' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $ovpn) {
+        Write-PhaseLog INFO 'VPN skipped (no staged profile)'
+        return
+    }
+
+    New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
+    Copy-Item -LiteralPath $ovpn.FullName -Destination (Join-Path $ConfigDir $ovpn.Name) -Force
+    Write-PhaseLog OK "VPN profile imported: $ConfigDir\$($ovpn.Name)"
+
+    # Open the OpenVPN GUI at logon (and now) - only if OpenVPN actually installed in Phase A.
+    if (Test-Path -LiteralPath $GuiPath) {
+        $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+        try { Set-ItemProperty -Path $runKey -Name 'OpenVPN-GUI' -Value ('"{0}"' -f $GuiPath) } catch { }
+        try {
+            Start-Process -FilePath $GuiPath -ErrorAction Stop
+            Write-PhaseLog OK 'OpenVPN GUI launched (connect manually with your credentials)'
+        } catch { Write-PhaseLog WARN "OpenVPN GUI did not launch: $($_.Exception.Message)" }
+    } else {
+        Write-PhaseLog WARN "OpenVPN GUI not found ($GuiPath) - profile imported, but the MSI install may have failed"
+    }
+}
+
 # Signal Phase B completion so the SYSTEM cleanup task can proceed. The flag holds
 # no credentials. Cleanup (the separate SYSTEM script) owns unregistering both
 # tasks, so this script does not deregister itself.
@@ -358,6 +397,8 @@ function Invoke-PhaseB {
     try { Install-UserSignature -State $state -SignaturesRoot $sigRoot } catch { Write-PhaseLog ERROR "Signature: $($_.Exception.Message)" }
 
     try { Set-UserDefaultPrinter -PrinterName $state.PrinterName } catch { Write-PhaseLog ERROR "Default printer: $($_.Exception.Message)" }
+
+    try { Install-UserVpnProfile -StagingRoot (Join-Path $stateDir 'VPN') } catch { Write-PhaseLog ERROR "VPN profile: $($_.Exception.Message)" }
 
     try { Write-UserDoneFlag -StateDir $stateDir } catch { Write-PhaseLog ERROR "Done flag: $($_.Exception.Message)" }
 

@@ -4,6 +4,9 @@ config.ps1
 # Resumo técnico interno (IPs/arquitetura/portais internos) — repo é PÚBLICO, NUNCA commitar
 resumo-windows-auto.md
 
+# Handoff de sessão (contexto interno + IPs) — fica local, NUNCA commitar
+HANDOFF.md
+
 # Harness de "ensaio real" (aponta pro pendrive real/local) — fica local, fora do repo público
 tests/prep-real.ps1
 tests/bootstrap-real.ps1
