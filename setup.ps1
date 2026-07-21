@@ -1,0 +1,2335 @@
+﻿#Requires -Version 5.1
+param(
+    [switch]$Unattended,
+    [string]$TestFullName  = 'Test User',
+    [string]$TestUsername  = 'test.user',
+    [string]$TestDomain    = '',
+    [string]$TestSector    = '',
+    [switch]$TestStaticIp,
+    [string]$TestIpAddress = '',
+    [switch]$TestWebAgent,
+    [switch]$TestVpn,
+    # One switch per corp link (mirrors the two GUI checkboxes). -TestBookmark0/-TestBookmark1
+    # map to $Bookmarks[0]/[1] so the headless path can toggle each link independently.
+    [switch]$TestBookmark0,
+    [switch]$TestBookmark1,
+    # Two-phase handoff (PHASE 8). OFF by default so the harness (interactive sandbox + -Headless)
+    # and any single-phase run behave as before - they never stage, arm AutoLogon, or reboot.
+    # Production turns it on via autounattend (task 3e). -EnableHandoff: stage Phase B + register the
+    # tasks + arm AutoLogon + reboot. -NoReboot (with -EnableHandoff): stage + arm but skip the
+    # Restart-Computer (throwaway-VM inspection only - leaves the plaintext password in HKLM).
+    [switch]$EnableHandoff,
+    [switch]$NoReboot,
+    # Test seam: dot-source with -LoadOnly to define the pure validator functions below
+    # WITHOUT running the provisioning body (used by tests/unit). Never set in production.
+    [switch]$LoadOnly
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ============================================================
+# Input normalizers / validators (pure functions, no UI/theme dependency).
+# Declared at the top so BOTH the interactive form AND the headless -Test*
+# path call the SAME validators - automation cannot drive the script into a
+# broken state. StrictMode-safe (only [regex], System.Text, System.Globalization).
+# ============================================================
+
+# Strip accents: FormD decomposes 'o-acute' -> 'o' + combining mark, drop every
+# NonSpacingMark, recompose. 'c-cedilla' -> 'c'. Handles a-tilde, e-circ, etc.
+function Remove-Diacritics {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $d  = $Text.Normalize([System.Text.NormalizationForm]::FormD)
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($ch in $d.ToCharArray()) {
+        if ([System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark) {
+            [void]$sb.Append($ch)
+        }
+    }
+    return $sb.ToString().Normalize([System.Text.NormalizationForm]::FormC)
+}
+
+# Display name (signature + New-LocalUser -FullName): letters/space/hyphen/apostrophe
+# only, Title Case, with Portuguese particles lowercased ('Joao Da Silva' -> 'Joao da Silva').
+function Format-FullName {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $c = [regex]::Replace($Text, "[^\p{L}\s\-']", '')
+    $c = [regex]::Replace($c, '\s+', ' ').Trim()
+    if ($c -eq '') { return '' }
+    $c = (Get-Culture).TextInfo.ToTitleCase($c.ToLower())
+    foreach ($p in 'Da','De','Do','Das','Dos','E') {
+        $c = [regex]::Replace($c, "\b$p\b", $p.ToLower())
+    }
+    return $c
+}
+
+# Login / email prefix: lowercase name.surname. Case-sensitive match so an
+# upstream bug leaving an uppercase char fails loudly instead of slipping through.
+function Test-Username {
+    param([string]$Username)
+    # Cap at 20 chars (audit A3): New-LocalUser rejects names longer than the SAM account limit,
+    # so a longer name.surname would pass the form yet fail later at account creation, leaving the
+    # machine with no user and Phase B never armed.
+    return ($Username -cmatch '^[a-z]+\.[a-z]+$' -and $Username.Length -le 20)
+}
+
+# Strict IPv4: exactly 4 octets, each 0-255. Do NOT rely on TryParse alone -
+# it accepts '10.5' (2-part) and hex forms that New-NetIPAddress would choke on.
+function Test-Ipv4 {
+    param([string]$Ip)
+    if ([string]::IsNullOrWhiteSpace($Ip)) { return $false }
+    $o = $Ip.Trim() -split '\.'
+    if ($o.Count -ne 4) { return $false }
+    foreach ($x in $o) { if ($x -notmatch '^\d{1,3}$' -or [int]$x -gt 255) { return $false } }
+    return $true
+}
+
+# Derive the Windows login / e-mail prefix from the first + last name as firstname.surname,
+# accent-stripped, lowercase, letters only. 'Joao Pedro' + 'da Silva' -> 'joao.silva', and a whole
+# name typed in a single box ('Joao Silva' + '') -> 'joao.silva' too. Returns '' until at least two
+# usable tokens exist across both fields (the form keeps the Username empty meanwhile).
+function Format-Username {
+    param([string]$First, [string]$Last)
+    # Tokenize the COMBINED "First Last" stream so splitting the name across the two boxes OR typing
+    # it all in one box both work; the old both-boxes-required gate silently left Username empty when
+    # the whole name went in one box (the two-box layout invites exactly that).
+    $tok = @(((Remove-Diacritics ("$First $Last")) -replace '[^A-Za-z ]', '') -split '\s+' | Where-Object { $_ })
+    if ($tok.Count -lt 2) { return '' }
+    return ($tok[0] + '.' + $tok[-1]).ToLower()
+}
+
+# Parse printers.json into the list the form renders. Pure (path in / object out, no logging or
+# form vars) so it sits above the -LoadOnly seam and the unit tests cover the two field-deploy bugs
+# that used to hide below it: the 5.1 top-level-array collapse and the BOM/encoding decode.
+function Read-PrinterList {
+    param([Parameter(Mandatory)][string]$Path)
+    # ReadAllText auto-detects a UTF-8/UTF-16 BOM (Notepad often saves printers.json as UTF-16);
+    # forcing -Encoding UTF8 would decode such a file to garbage. Assign BEFORE @() so a top-level
+    # JSON array is not collapsed to a single nested element on Windows PowerShell 5.1 (production).
+    $parsed = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    $raw    = @($parsed)
+    # Classify every entry so the caller can report WHICH one failed and WHY (missing field vs
+    # invalid ip), instead of a bare count. Under StrictMode touching a missing property is a hard
+    # error, so gate each access on PSObject.Properties.
+    $valid   = [System.Collections.Generic.List[object]]::new()
+    $dropped = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $raw) {
+        $n        = $p.PSObject.Properties.Name
+        $hasName  = ($n -contains 'name')  -and $p.name
+        $hasModel = ($n -contains 'model') -and $p.model
+        $hasIp    = ($n -contains 'ip')    -and $p.ip
+        $label    = if ($hasName) { [string]$p.name } else { '(unnamed)' }
+        if (-not ($hasName -and $hasModel -and $hasIp)) {
+            $dropped.Add([pscustomobject]@{ name = $label; reason = 'missing field' })
+        } elseif (-not (Test-Ipv4 $p.ip)) {
+            # A malformed ip ("10.0.0.999", "10,0,0,1") passes the presence check but the port add
+            # later swallows the failure (-EA SilentlyContinue), so reject it up front.
+            $dropped.Add([pscustomobject]@{ name = $label; reason = "invalid ip '$($p.ip)'" })
+        } else {
+            $valid.Add($p)
+        }
+    }
+    return [pscustomobject]@{ Printers = @($valid); Total = $raw.Count; Dropped = @($dropped) }
+}
+
+# Locate the Epson PRINTER driver .inf inside $PathEpson. The extracted Epson bundle ships several
+# INFs - the printer one (Class=Printer) plus port/language-monitor helpers (Class=USB) - so prefer a
+# Class=Printer INF and only fall back to the first .inf if none declares it. Pure (path in / path
+# out, no side effects) so it sits above the -LoadOnly seam and the unit tests cover it.
+function Resolve-EpsonInf {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $infs = @(Get-ChildItem -LiteralPath $Path -Recurse -Filter '*.inf' -ErrorAction SilentlyContinue |
+              Sort-Object FullName)
+    if ($infs.Count -eq 0) { return $null }
+    foreach ($i in $infs) {
+        # ReadAllText auto-detects the INF encoding (printer INFs are usually UTF-16).
+        if ([System.IO.File]::ReadAllText($i.FullName) -match '(?im)^\s*Class\s*=\s*Printer\s*$') {
+            return $i.FullName
+        }
+    }
+    return $infs[0].FullName
+}
+
+# Parse the printer model display name(s) a driver .inf registers (e.g. "EPSON WF-M5899 Series"), so
+# the caller can Add-PrinterDriver by name after pnputil stages the files. Resolves the manufacturer's
+# model section(s) (incl. the .NT<arch> decoration) and reads the quoted / %token% model names, using
+# [Strings] for token expansion. Pure/testable. Returns an array (possibly empty).
+function Get-InfPrinterModels {
+    param([Parameter(Mandatory)][string]$InfPath)
+    if (-not (Test-Path -LiteralPath $InfPath)) { return @() }
+    $lines = [System.IO.File]::ReadAllText($InfPath) -split "`r?`n"
+    # Split into sections: name -> content lines (comments and blanks dropped).
+    $sections = @{}; $cur = $null
+    foreach ($ln in $lines) {
+        $t = ($ln -replace ';.*$', '').Trim()
+        if ($t -match '^\[(.+)\]$') { $cur = $matches[1].Trim(); if (-not $sections.ContainsKey($cur)) { $sections[$cur] = New-Object System.Collections.Generic.List[string] }; continue }
+        if ($cur -and $t) { $sections[$cur].Add($t) }
+    }
+    if (-not $sections.ContainsKey('Manufacturer')) { return @() }
+    $strings = @{}
+    if ($sections.ContainsKey('Strings')) {
+        foreach ($s in $sections['Strings']) { if ($s -match '^(\w+)\s*=\s*"?([^"]*)"?\s*$') { $strings[$matches[1]] = $matches[2] } }
+    }
+    $models = New-Object System.Collections.Generic.List[string]
+    foreach ($mfg in $sections['Manufacturer']) {
+        if ($mfg -notmatch '=') { continue }
+        $parts = (($mfg -split '=', 2)[1]) -split ','
+        $base  = $parts[0].Trim()
+        $cands = @($base); for ($k = 1; $k -lt $parts.Count; $k++) { $cands += "$base.$($parts[$k].Trim())" }
+        foreach ($sec in $cands) {
+            if (-not $sections.ContainsKey($sec)) { continue }
+            foreach ($ml in $sections[$sec]) {
+                if     ($ml -match '^\s*"([^"]+)"\s*=') { $name = $matches[1] }
+                elseif ($ml -match '^\s*%(\w+)%\s*=')   { $name = if ($strings.ContainsKey($matches[1])) { $strings[$matches[1]] } else { $matches[1] } }
+                else { continue }
+                if ($name -and -not $models.Contains($name)) { $models.Add($name) }
+            }
+        }
+    }
+    return $models.ToArray()
+}
+
+# Build the Phase A -> Phase B handoff state object (serialized to state.json in PHASE 8). Pure:
+# string-in / object-out, references no config/form vars, so tests dot-source this file with
+# -LoadOnly and round-trip it against phase-b.ps1's Read-CorpState. Takes NO credential - state.json
+# never carries one, and the field set here IS the contract phase-b reads. The 3 required fields are
+# Mandatory (a blank one can't even be built); Read-CorpState re-checks them on read (defense in depth).
+function New-CorpStateObject {
+    param(
+        [Parameter(Mandatory)][string]$Username,
+        [Parameter(Mandatory)][string]$FullName,
+        [Parameter(Mandatory)][string]$Email,
+        [string]$EmailDomain   = '',
+        [string]$SectorName    = '',
+        [string]$SigTemplate   = '',
+        [string]$PrinterName   = '',
+        [string]$WallpaperPath = '',
+        # Corp bookmarks selected in Phase A (array of @{Name;Url}); Phase B seeds them into the
+        # standard user's Chrome/Edge profile. NOT a credential - safe in state.json.
+        [object[]]$Bookmarks   = @(),
+        # Names of bookmarks that also get a desktop .url shortcut in Phase B (from
+        # $DesktopShortcutBookmarks in config.ps1). Plain strings - safe in state.json.
+        [string[]]$DesktopShortcutNames = @()
+    )
+    return [pscustomobject]@{
+        Username             = $Username
+        FullName             = $FullName
+        Email                = $Email
+        EmailDomain          = $EmailDomain
+        SectorName           = $SectorName
+        SigTemplate          = $SigTemplate
+        PrinterName          = $PrinterName
+        WallpaperPath        = $WallpaperPath
+        Bookmarks            = $Bookmarks
+        DesktopShortcutNames = $DesktopShortcutNames
+    }
+}
+
+# Validate a written state.json before Phase A arms AutoLogon (audit A8): parse it and confirm the
+# mandatory handoff fields are present, so a truncated/partial file (e.g. power loss mid-write) is
+# rejected by the $ready gate instead of passing a bare Test-Path and rebooting into a doomed Phase
+# B handoff. Pure and read-only, so it sits above the -LoadOnly seam and the unit tests exercise it.
+function Test-StateJson {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $s = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch { return $false }
+    if ($null -eq $s) { return $false }
+    # Property-bag access (not $s.Field) so a missing field returns $false instead of throwing under
+    # Set-StrictMode Latest.
+    foreach ($f in 'Username', 'FullName', 'Email') {
+        $prop = $s.PSObject.Properties[$f]
+        if (-not $prop -or [string]::IsNullOrEmpty([string]$prop.Value)) { return $false }
+    }
+    return $true
+}
+
+# Build the Firefox bookmark policy payload (distribution\policies.json), plus the flat Chromium
+# [{name,url},...] shape which is now RETAINED ONLY as a unit-test reference - Chrome/Edge are no
+# longer written via managed policy (that buried the links in a folder); they are seeded per-user
+# in phase-b.ps1 (ConvertTo-ChromiumBookmarkFile) so the links sit loose on the bar. PURE: returns
+# the JSON strings and writes nothing, so it sits above the -LoadOnly seam and the unit tests assert
+# the payload shape without touching the registry or the filesystem. $Bookmarks is an array of
+# @{ Name = '...'; Url = '...' }. ConvertTo-Json runs per item and the array is joined by hand
+# because PS 5.1's ConvertTo-Json collapses a single-element array into a bare object.
+function ConvertTo-BrowserBookmarkPolicy {
+    param([Parameter(Mandatory)][object[]]$Bookmarks)
+
+    # Flat [{name,url},...] shape (retained for the tests; not written to any browser anymore).
+    $chromiumItems = foreach ($b in $Bookmarks) {
+        [pscustomobject]@{ name = [string]$b.Name; url = [string]$b.Url } | ConvertTo-Json -Compress
+    }
+    $chromiumJson = '[' + ($chromiumItems -join ',') + ']'
+
+    # Firefox has no bookmark registry policy; it reads a policies.json. Placement 'toolbar' pins the
+    # link to the bookmarks toolbar (visible without opening a folder).
+    $firefoxItems = foreach ($b in $Bookmarks) {
+        [pscustomobject]@{ Title = [string]$b.Name; URL = [string]$b.Url; Placement = 'toolbar' } | ConvertTo-Json -Compress
+    }
+    $firefoxJson = '{"policies":{"Bookmarks":[' + ($firefoxItems -join ',') + ']}}'
+
+    return [pscustomobject]@{
+        ChromiumJson = $chromiumJson   # kept for the unit tests; Firefox uses FirefoxJson below
+        FirefoxJson  = $firefoxJson
+    }
+}
+
+# Pick the subset of $Bookmarks whose parallel $Flags entry is $true. The two GUI checkboxes
+# (and the two -TestBookmark0/1 switches) are per-link, so this is the single point both paths
+# converge on. PURE: tolerates $null bookmarks and a $Flags array shorter/longer than the list,
+# so a config with fewer links than flags (or vice versa) never faults under StrictMode. Output
+# ENUMERATES like any PS function - an empty selection emits NOTHING (AutomationNull), so callers
+# must @()-wrap the call (the body does); binding the bare result to an [object[]] parameter
+# would pass $null and end up as "Bookmarks": null in state.json.
+function Select-EnabledBookmarks {
+    param([object[]]$Bookmarks, [bool[]]$Flags)
+    $out = @()
+    if ($null -eq $Bookmarks) { return $out }
+    for ($i = 0; $i -lt $Bookmarks.Count; $i++) {
+        if ($Flags -and $i -lt $Flags.Count -and $Flags[$i]) { $out += $Bookmarks[$i] }
+    }
+    return $out
+}
+
+# Resolve which wallpaper file to stage for the selected email domain: the per-domain override if
+# the map has one, else the default. PURE: tolerates a $null map (config may omit $WallpaperByDomain,
+# which $OptionalConfig then sets to $null). Real domain strings live in config.ps1, off the public repo.
+function Resolve-WallpaperFile {
+    param([string]$Domain, [hashtable]$Map, [string]$Default)
+    if ($Map -and $Domain -and $Map.ContainsKey($Domain)) { return $Map[$Domain] }
+    return $Default
+}
+
+# Builds the WLAN profile XML for `netsh wlan add profile`. PURE: string in -> string out, so it
+# sits above the -LoadOnly seam and the unit tests cover it. $Authentication:
+#   WPA2PSK - v1 schema only (works on every Windows/driver)
+#   WPA3SAE - adds the v4-namespace <transitionMode>true</>, so ONE profile associates to
+#             WPA3-only, WPA2/WPA3 mixed and WPA2-only APs (Win11 21H2+; older OS ignores it).
+# SSID and passphrase are XML-escaped HERE so no caller can forget.
+function New-WlanProfileXml {
+    # By design (same rationale as the PSAvoidUsingConvertToSecureStringWithPlainText exclusion in
+    # PSScriptAnalyzerSettings.psd1): the PSK originates in the operator's plaintext config.ps1 and
+    # must land in plaintext inside the WLAN profile XML netsh consumes - a SecureString round-trip
+    # in between protects nothing.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase')]
+    param(
+        [Parameter(Mandatory)][string]$Ssid,
+        [string]$Passphrase = '',
+        [ValidateSet('WPA2PSK', 'WPA3SAE')][string]$Authentication = 'WPA2PSK'
+    )
+    $s = [System.Security.SecurityElement]::Escape($Ssid)
+    $p = [System.Security.SecurityElement]::Escape($Passphrase)
+    $transition = ''
+    if ($Authentication -eq 'WPA3SAE') {
+        $transition = "`n      <transitionMode xmlns=`"http://www.microsoft.com/networking/WLAN/profile/v4`">true</transitionMode>"
+    }
+    return @"
+<?xml version="1.0"?>
+<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">
+  <name>$s</name>
+  <SSIDConfig><SSID><name>$s</name></SSID></SSIDConfig>
+  <connectionType>ESS</connectionType>
+  <connectionMode>auto</connectionMode>
+  <MSM><security>
+    <authEncryption>
+      <authentication>$Authentication</authentication>
+      <encryption>AES</encryption>
+      <useOneX>false</useOneX>$transition
+    </authEncryption>
+    <sharedKey>
+      <keyType>passPhrase</keyType>
+      <protected>false</protected>
+      <keyMaterial>$p</keyMaterial>
+    </sharedKey>
+  </security></MSM>
+</WLANProfile>
+"@
+}
+
+# Test seam: when dot-sourced with -LoadOnly (tests/unit), stop here so only the pure
+# validator functions above are defined - the provisioning body below never runs.
+if ($LoadOnly) { return }
+
+# ============================================================
+# setup.ps1 - Windows 11 Setup
+# Run automatically by autounattend.xml on the first login
+# Requires: config.ps1 at the USB root (gitignored, never commit)
+# ============================================================
+
+$LogFile      = "$env:USERPROFILE\Desktop\win11_setup_log.txt"
+$ScriptDir    = $PSScriptRoot
+$script:Errors = [System.Collections.Generic.List[string]]::new()
+
+# Absolute path of the wallpaper PHASE 4 copies into %WINDIR% (empty until/unless that runs).
+# Handed to Phase B via state.json. Declared up front so StrictMode never sees it unset.
+$script:WallpaperStaged = ''
+
+# Whether Connect-CorpWifi VERIFIED an association. Declared up front (StrictMode) because two
+# call sites read it: Phase A sets it, the pre-Phase-7 retry only runs when it is still $false.
+$script:WifiConnected = $false
+
+# Live-progress UI state. The input form is modal (ShowDialog) on the main thread; the
+# work (PHASE 4-7) runs here on the main thread, while a SEPARATE STA runspace shows a
+# progress window with a real message loop (Application.Run) and a Timer that drains the
+# log queue. So heavy work never blocks the window -> no "not responding". All three are
+# $null when headless (-Unattended) -> every UI touch no-ops and behavior matches the original.
+$script:LogQueue = $null   # ConcurrentQueue[object] of {Level, Line}; $null = headless
+$script:UiState  = $null   # synchronized hashtable: { Done, Status }
+$script:ProgUI   = $null   # @{ PS; Handle; Runspace } for the progress runspace
+
+function Write-Log {
+    param([string]$Level, [string]$Msg)
+    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$ts] [$Level] $Msg"
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-Host $line
+    if ($Level -in 'ERROR', 'FATAL') {
+        $script:Errors.Add("[$Level] $Msg") | Out-Null
+    }
+    # Tee to the progress window: enqueue (thread-safe). The runspace Timer drains it.
+    if ($script:LogQueue) {
+        try { $script:LogQueue.Enqueue([pscustomobject]@{ Level = $Level; Line = $line }) } catch { }
+    }
+}
+
+# Updates the progress-window status caption (drained by the Timer). No-op when headless.
+function Set-Phase([string]$text) {
+    if ($script:UiState) { $script:UiState.Status = $text }
+}
+
+# Evaluates an installer exit code and logs OK/ERROR (instead of assuming OK).
+# 3010 (reboot required) counts as success for MSI.
+function Write-ProcResult {
+    param([string]$Name, $Proc, [int[]]$OkCodes = @(0))
+    if ($null -eq $Proc) { Write-Log 'ERROR' "${Name}: process did not start"; return }
+    if ($OkCodes -contains $Proc.ExitCode) {
+        Write-Log 'OK' "$Name exit $($Proc.ExitCode)"
+    } else {
+        Write-Log 'ERROR' "$Name failed (exit $($Proc.ExitCode))"
+    }
+}
+
+# Runs an installer and waits up to $TimeoutSec, killing it on timeout. A hung silent installer
+# (e.g. msiexec /quiet blocked on a dialog) would otherwise block the whole provision forever.
+# Returns the finished process (for Write-ProcResult) or $null if it had to be killed.
+function Invoke-InstallerWithTimeout {
+    param([string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutSec = 1800, [string]$WorkingDirectory)
+    $params = @{ FilePath = $FilePath; PassThru = $true }
+    if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
+    if ($WorkingDirectory) { $params['WorkingDirectory'] = $WorkingDirectory }
+    $proc = Start-Process @params
+    if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+        try { $proc.Kill() } catch { }
+        Write-Log 'ERROR' "$FilePath timed out after ${TimeoutSec}s - killed"
+        return $null
+    }
+    return $proc
+}
+
+# Quick "is the internet actually reachable" probe for the online installers (Ninite / Office C2R):
+# they fail with a WinINet 0x80072Exx error when the box has no network yet. A TCP connect to a
+# couple of well-known hosts on 443 tests DNS + routing without relying on ICMP (often firewalled).
+function Test-InternetUp {
+    param([int]$TimeoutMs = 3000)
+    foreach ($h in @('www.microsoft.com', 'ninite.com')) {
+        $client = $null
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $iar = $client.BeginConnect($h, 443, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs) -and $client.Connected) { return $true }
+        } catch { }
+        finally { if ($client) { $client.Close() } }
+    }
+    return $false
+}
+
+# Full WiFi bring-up: readiness gate -> WPA3 detect -> add profile -> connect -> verify.
+# Returns $true only when the association was VERIFIED; $false otherwise. NEVER throws (WiFi is
+# best-effort; provisioning continues on a wired link). Idempotent: returns $true without
+# touching anything when the wireless adapter is already associated to $Ssid, so it is safe to
+# call twice (Phase A + the pre-Phase-7 retry).
+# Windows 11 24H2 gate (seen in the field): netsh wlan commands that expose network info
+# (connect / show interfaces / show networks) fail with "network shell commands need location
+# permission" while Location services are off - and this fleet ships with them off. Hence:
+#   - a failing `netsh wlan connect` is expected and non-fatal: the profile carries
+#     connectionMode=auto and WLAN auto-connect does NOT depend on Location;
+#   - association is verified via CIM (Get-NetAdapter / Get-NetConnectionProfile), which is
+#     neither location-gated nor localized (netsh text is pt-BR on this fleet).
+function Connect-CorpWifi {
+    # Plaintext by design - see New-WlanProfileXml's suppression note.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', 'Passphrase')]
+    param(
+        [Parameter(Mandatory)][string]$Ssid,
+        [string]$Passphrase = '',
+        [int]$AdapterWaitSec = 60,   # gate: PnP may still be installing the WLAN driver
+        [int]$ConnectWaitSec = 30    # verify: wait for auto-association after the profile lands
+    )
+    try {
+        $getWlanAdapter = {
+            Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+                Where-Object { $_.PhysicalMediaType -match 'Native 802\.11|Wireless' } |
+                Select-Object -First 1
+        }
+        # Associated = WLAN adapter Up AND the connection profile name matches the SSID (for
+        # infrastructure WiFi the profile name IS the SSID). Adapter-Up alone could be some
+        # other network the operator joined by hand.
+        $isAssociated = {
+            $a = & $getWlanAdapter
+            if (-not $a -or $a.Status -ne 'Up') { return $false }
+            $prof = Get-NetConnectionProfile -InterfaceIndex $a.ifIndex -ErrorAction SilentlyContinue
+            return [bool]($prof -and $prof.Name -eq $Ssid)
+        }
+
+        if (& $isAssociated) {
+            Write-Log 'OK' "WiFi already connected to '$Ssid' - nothing to do"
+            return $true
+        }
+
+        # WlanSvc gate: netsh wlan is a no-op without the WLAN AutoConfig service.
+        $svc = Get-Service -Name WlanSvc -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Write-Log 'WARN' 'WiFi: WLAN AutoConfig service (WlanSvc) not present - no wireless capability; skipped'
+            return $false
+        }
+        if ($svc.Status -ne 'Running') {
+            Write-Log 'INFO' 'WiFi: starting WLAN AutoConfig service (WlanSvc)...'
+            try { Start-Service -Name WlanSvc -ErrorAction Stop } catch {
+                Write-Log 'WARN' "WiFi: could not start WlanSvc ($($_.Exception.Message)) - skipped"
+                return $false
+            }
+        }
+
+        # Adapter gate: on first boot PnP may still be installing the wireless driver, so poll
+        # (bounded) instead of failing instantly. "No WiFi card" and "driver still coming" are
+        # indistinguishable here; the retry call site passes a short wait so a WiFi-less desktop
+        # pays the full wait only once.
+        $adapter = & $getWlanAdapter
+        if (-not $adapter) {
+            Write-Log 'INFO' "WiFi: no wireless adapter yet - waiting up to ${AdapterWaitSec}s (PnP may still be installing the driver)..."
+            $deadline = (Get-Date).AddSeconds($AdapterWaitSec)
+            while (-not $adapter -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 3
+                $adapter = & $getWlanAdapter
+            }
+        }
+        if (-not $adapter) {
+            Write-Log 'WARN' "WiFi: no wireless adapter found after ${AdapterWaitSec}s (desktop without a WiFi card, or driver missing) - skipped"
+            return $false
+        }
+
+        # WPA3 pick: driver capability tokens (WPA3-SAE/WPA3-Personal) are not localized, and
+        # `show drivers` reveals no network info so it is not behind the 24H2 location gate.
+        # With WPA3 support, ONE transition-mode profile covers WPA3-only, mixed and WPA2-only APs.
+        $drvOut = netsh wlan show drivers 2>&1
+        $useWpa3 = ($LASTEXITCODE -eq 0) -and (($drvOut | Out-String) -match 'WPA3')
+        $auth = if ($useWpa3) { 'WPA3SAE' } else { 'WPA2PSK' }
+        Write-Log 'INFO' "WiFi: using $(if ($useWpa3) { 'WPA3-SAE transition-mode' } else { 'WPA2-PSK' }) profile (driver $(if ($useWpa3) { 'supports' } else { 'does not report' }) WPA3)"
+
+        # Add the profile. The temp XML holds the plaintext PSK - delete it the moment netsh
+        # imported it. netsh is a native exe: non-zero does not throw, so check $LASTEXITCODE.
+        $wifiXmlPath = "$env:TEMP\corp_wifi_profile.xml"
+        try {
+            Set-Content -Path $wifiXmlPath -Value (New-WlanProfileXml -Ssid $Ssid -Passphrase $Passphrase -Authentication $auth) -Encoding UTF8
+            $addOut = netsh wlan add profile filename="$wifiXmlPath" 2>&1
+            if ($LASTEXITCODE -ne 0 -and $auth -eq 'WPA3SAE') {
+                # Old build/driver rejected the WPA3SAE XML: fall back to plain WPA2-PSK.
+                Write-Log 'WARN' "WiFi: WPA3-SAE profile rejected ($LASTEXITCODE): $addOut - falling back to WPA2-PSK"
+                $auth = 'WPA2PSK'
+                Set-Content -Path $wifiXmlPath -Value (New-WlanProfileXml -Ssid $Ssid -Passphrase $Passphrase -Authentication $auth) -Encoding UTF8
+                $addOut = netsh wlan add profile filename="$wifiXmlPath" 2>&1
+            }
+            if ($LASTEXITCODE -ne 0) { throw "netsh wlan add profile failed ($LASTEXITCODE): $addOut" }
+        } finally {
+            Remove-Item -Path $wifiXmlPath -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log 'OK' "WiFi profile '$Ssid' added ($auth, auto-connect)"
+
+        # Nudge a connect. On 24H2 with Location off this returns 1 ("...need location
+        # permission") - expected; connectionMode=auto associates on its own, so the failed
+        # nudge costs nothing and the CIM poll below still observes the association.
+        $connOut = netsh wlan connect name="$Ssid" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log 'INFO' "WiFi: 'netsh wlan connect' unavailable (exit $LASTEXITCODE, likely the 24H2 location-permission gate) - relying on auto-connect"
+        }
+
+        # Verify via CIM (location-gate/locale immune): adapter Up + profile name == SSID.
+        $deadline = (Get-Date).AddSeconds($ConnectWaitSec)
+        while ((Get-Date) -lt $deadline) {
+            if (& $isAssociated) {
+                Write-Log 'OK' "WiFi connected to '$Ssid' ($auth profile)"
+                return $true
+            }
+            Start-Sleep -Seconds 3
+        }
+
+        Write-Log 'WARN' ("WiFi: profile '$Ssid' was ADDED but association was not confirmed in ${ConnectWaitSec}s - " +
+            "out of range, wrong passphrase, or WPA2/WPA3 mismatch (profile used $auth). " +
+            'The profile persists with auto-connect; it will join once the network is reachable.' +
+            $(if ($connOut) { " netsh connect said: $connOut" } else { '' }))
+        return $false
+    } catch {
+        Write-Log 'WARN' "WiFi: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Global trap = last-resort net for a terminating error NOT handled by try/catch.
+# Aborts with exit 1 (instead of 'continue') so we don't proceed over inconsistent state
+# and so the caller (run.bat checks %errorlevel%) is told it failed.
+trap {
+    $msg = "Unhandled fatal error at line $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.Message)"
+    Write-Log 'FATAL' $msg
+    # If the progress window is up, let the technician read the fatal line before we exit.
+    if ($script:ProgUI) {
+        try {
+            $script:UiState.Status = 'FATAL error - review the log above, then close.'
+            $script:UiState.Done   = $true
+            $script:ProgUI.PS.EndInvoke($script:ProgUI.Handle)
+        } catch { }
+    }
+    exit 1
+}
+
+# GUI assemblies for the input form (ShowDialog) on the main thread. Failure is fatal.
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+} catch {
+    Write-Log 'FATAL' "Failed to load GUI assemblies: $($_.Exception.Message)"
+    exit 1
+}
+
+# --- Input-form helpers (used by the PHASE 3 ShowDialog form, at script scope).
+# The redesigned grouped/themed form uses width-only textbox/combo (the position is set by
+# Add-Field), New-Group for titled GroupBoxes, and Add-Field to stack a muted label + control.
+# These reference the theme vars ($Clr*/$Font*) and $Form defined in the form block below; they
+# are only ever called from there, after those vars are assigned (if/try do not open a scope). ---
+function New-TextBox([int]$w = 496) {
+    $t = New-Object System.Windows.Forms.TextBox
+    $t.Size        = New-Object System.Drawing.Size($w, 25)
+    $t.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $t.BackColor   = $ClrCard
+    return $t
+}
+# Flat read-only dropdown (width only; position set by Add-Field or caller).
+function New-Combo([int]$w = 496) {
+    $c = New-Object System.Windows.Forms.ComboBox
+    $c.Size          = New-Object System.Drawing.Size($w, 25)
+    $c.DropDownStyle = 'DropDownList'
+    $c.FlatStyle     = [System.Windows.Forms.FlatStyle]::Flat
+    $c.BackColor     = $ClrCard
+    return $c
+}
+# A titled GroupBox added to the form; returns it for child placement.
+function New-Group([string]$title, [int]$x, [int]$y, [int]$w, [int]$h) {
+    $g = New-Object System.Windows.Forms.GroupBox
+    $g.Text      = $title
+    $g.Font      = $FontGroup
+    $g.ForeColor = $ClrText
+    $g.Location  = New-Object System.Drawing.Point($x, $y)
+    $g.Size      = New-Object System.Drawing.Size($w, $h)
+    $Form.Controls.Add($g)
+    return $g
+}
+# Stack a muted label (with optional red required '*') above a control inside
+# $parent at relative (px,py). Returns the next free py.
+function Add-Field($parent, [string]$labelText, $control, [int]$px, [int]$py, [bool]$required = $false) {
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $labelText; $l.AutoSize = $true; $l.ForeColor = $ClrMuted; $l.Font = $FontBase
+    $l.Location = New-Object System.Drawing.Point($px, $py)
+    $parent.Controls.Add($l)
+    if ($required) {
+        $star = New-Object System.Windows.Forms.Label
+        $star.Text = ' *'; $star.AutoSize = $true; $star.ForeColor = $ClrReq; $star.Font = $FontBase
+        $star.Location = New-Object System.Drawing.Point(($px + $l.PreferredWidth - 4), $py)
+        $parent.Controls.Add($star)
+    }
+    $control.Location = New-Object System.Drawing.Point($px, ($py + 20))
+    $parent.Controls.Add($control)
+    return ($py + 20 + $control.Height + 12)
+}
+
+# Launches the progress window in its own STA runspace. The window runs a real message loop
+# (Application.Run) so it stays responsive while the main thread does heavy work; a Timer
+# drains $script:LogQueue into the colored RichTextBox and reflects $script:UiState. Returns
+# the runspace handles so the caller can mark Done and wait for the user to close the window.
+function Start-ProgressWindow {
+    $script:LogQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+    # WillReboot: closing the window will reboot into Phase B (only under -EnableHandoff without
+    # -NoReboot). When true the window shows an auto-reboot countdown so the handoff proceeds even
+    # if nobody clicks Close; a "Pause" checkbox lets the technician stop it to review the log first.
+    $script:UiState  = [hashtable]::Synchronized(@{
+        Done         = $false
+        Status       = 'Starting setup...'
+        WillReboot   = ($EnableHandoff -and -not $NoReboot)
+        CountdownSec = 60
+    })
+
+    $uiScript = {
+        param($Queue, $State)
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        $clr = @{
+            OK    = [System.Drawing.Color]::FromArgb(80, 220, 100)
+            WARN  = [System.Drawing.Color]::FromArgb(235, 200, 60)
+            ERROR = [System.Drawing.Color]::FromArgb(240, 90, 90)
+            FATAL = [System.Drawing.Color]::FromArgb(255, 70, 70)
+            INFO  = [System.Drawing.Color]::FromArgb(190, 190, 190)
+        }
+
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text          = 'Setup - Progress'
+        $form.Size          = New-Object System.Drawing.Size(780, 560)
+        $form.StartPosition = 'CenterScreen'
+
+        $status = New-Object System.Windows.Forms.Label
+        $status.Dock      = 'Top'
+        $status.Height    = 24
+        $status.TextAlign = 'MiddleLeft'
+        $status.Padding   = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+        $status.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+        $status.Text      = $State.Status
+
+        $bar = New-Object System.Windows.Forms.ProgressBar
+        $bar.Dock                  = 'Top'
+        $bar.Height                = 16
+        $bar.Style                 = 'Marquee'
+        $bar.MarqueeAnimationSpeed = 30
+
+        $rtb = New-Object System.Windows.Forms.RichTextBox
+        $rtb.Dock       = 'Fill'
+        $rtb.ReadOnly   = $true
+        $rtb.BackColor  = [System.Drawing.Color]::FromArgb(20, 20, 24)
+        $rtb.ForeColor  = [System.Drawing.Color]::FromArgb(200, 200, 200)
+        $rtb.Font       = New-Object System.Drawing.Font('Consolas', 9)
+        $rtb.WordWrap   = $false
+        $rtb.ScrollBars = 'Both'
+        $rtb.DetectUrls = $false
+
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Dock    = 'Bottom'
+        $btn.Height  = 34
+        $btn.Text    = 'Close'
+        $btn.Enabled = $false
+        $btn.Add_Click({ $form.Close() })
+
+        # Pause the auto-reboot countdown so the technician can read the log before Phase B. Shown
+        # only when closing will reboot; checking it clears the deadline (the Timer re-arms on uncheck).
+        $chkPause = New-Object System.Windows.Forms.CheckBox
+        $chkPause.Dock    = 'Bottom'
+        $chkPause.Height  = 26
+        $chkPause.Text    = 'Pause auto-reboot (review the log, then click the button)'
+        $chkPause.Padding = New-Object System.Windows.Forms.Padding(8, 0, 0, 0)
+        $chkPause.Visible = [bool]$State.WillReboot
+
+        # Monotonic timer for the auto-reboot countdown (started the first time Done + WillReboot
+        # are seen). A Stopwatch, NOT the wall clock: a w32time/NTP step during first boot must not
+        # jump the countdown to <=0 and reboot before the technician can hit Pause.
+        $script:swReboot = $null
+
+        # Dock order: Fill control added first, edges after -> log fills, status/bar on top, Close at bottom.
+        $form.Controls.Add($rtb)
+        $form.Controls.Add($bar)
+        $form.Controls.Add($status)
+        $form.Controls.Add($btn)
+        $form.Controls.Add($chkPause)
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 200
+        $timer.Add_Tick({
+            $item = $null
+            while ($Queue.TryDequeue([ref]$item)) {
+                $c = $clr[$item.Level]; if (-not $c) { $c = $clr['INFO'] }
+                $rtb.SelectionStart  = $rtb.TextLength
+                $rtb.SelectionLength = 0
+                $rtb.SelectionColor  = $c
+                $rtb.AppendText($item.Line + "`n")
+                $rtb.SelectionColor  = $rtb.ForeColor
+                $rtb.ScrollToCaret()
+            }
+            $status.Text = $State.Status
+            if ($State.Done) {
+                $bar.Style   = 'Continuous'
+                $bar.Value   = $bar.Maximum
+                $btn.Enabled = $true
+                if ($State.WillReboot) {
+                    if ($chkPause.Checked) {
+                        # Technician paused: stop the countdown, wait for a manual click. Nulling the
+                        # stopwatch also restarts the full countdown if they unpause.
+                        $script:swReboot = $null
+                        $btn.Text = 'Reboot now into Phase B'
+                    } else {
+                        if (-not $script:swReboot) { $script:swReboot = [System.Diagnostics.Stopwatch]::StartNew() }
+                        $remaining = [int][math]::Ceiling([int]$State.CountdownSec - $script:swReboot.Elapsed.TotalSeconds)
+                        if ($remaining -le 0) { $form.Close(); return }
+                        $btn.Text = "Reboot now into Phase B  (auto in ${remaining}s)"
+                    }
+                }
+            }
+        })
+        $timer.Start()
+
+        [System.Windows.Forms.Application]::Run($form)   # real message loop: stays responsive
+        $timer.Stop()
+    }
+
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'                # required for WinForms
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    $null = $ps.AddScript($uiScript).AddArgument($script:LogQueue).AddArgument($script:UiState)
+    $handle = $ps.BeginInvoke()
+
+    $script:ProgUI = [pscustomobject]@{ PS = $ps; Handle = $handle; Runspace = $rs }
+}
+
+# ============================================================
+# PHASE 1 - Load config.ps1 from the USB
+# ============================================================
+
+# Show a modal error dialog ONLY when a real interactive desktop is present (audit A16). These
+# config-load failures run before $useUI is computed, so a headless / -Unattended run would
+# otherwise hang forever on an invisible dialog. The failure is always logged regardless.
+function Show-FatalUi {
+    param([string]$Message, [string]$Title)
+    if ((-not $Unattended) -and [System.Environment]::UserInteractive) {
+        [System.Windows.Forms.MessageBox]::Show($Message, $Title, 'OK', 'Error') | Out-Null
+    }
+}
+
+$ConfigFile = Join-Path $ScriptDir 'config.ps1'
+if (-not (Test-Path $ConfigFile)) {
+    Write-Log 'FATAL' "config.ps1 not found at: $ScriptDir"
+    Show-FatalUi "config.ps1 not found at: $ScriptDir`nPut config.ps1 at the USB root and run again." 'Setup - Error'
+    exit 1
+}
+try {
+    . $ConfigFile
+    Write-Log 'OK' "config.ps1 loaded from: $ConfigFile"
+} catch {
+    Write-Log 'FATAL' "Failed to execute config.ps1: $($_.Exception.Message)"
+    Show-FatalUi "Error loading config.ps1:`n$($_.Exception.Message)" 'Setup - Fatal Error'
+    exit 1
+}
+
+# Validate the required config variables BEFORE using them (under StrictMode, indexing a
+# missing variable becomes a generic FATAL - here we give an actionable message and abort early).
+$RequiredConfig = @('AdminAccount', 'AdminNewPass', 'UserInitialPass', 'EmailDomains', 'PathSignatures')
+$missing = $RequiredConfig | Where-Object {
+    $v = Get-Variable $_ -ErrorAction SilentlyContinue
+    (-not $v) -or ($null -eq $v.Value) -or (($v.Value -is [string]) -and ($v.Value.Trim() -eq ''))
+}
+if ($missing) {
+    $msg = "config.ps1 does not define: " + ($missing -join ', ')
+    Write-Log 'FATAL' $msg
+    Show-FatalUi $msg 'Setup - incomplete config.ps1'
+    exit 1
+}
+
+# ============================================================
+# Context guard (production path only) - run BEFORE any mutation.
+# ============================================================
+# This script is about to rotate $AdminAccount's password and (in the two-phase flow) disable
+# that account and write machine handoff state. It MUST be running elevated AND as the bootstrap
+# admin account that autounattend created + AutoLogon'd; doing this from the wrong identity would
+# corrupt the wrong account and write to the wrong profile. Abort here, before the first change.
+# Exit 2 = fatal precondition (autounattend FirstLogonCommands propagates it - see exit contract:
+# 0 = success, 1 = errors tracked, 2 = fatal guard/config). Skipped under -Unattended, which is
+# the test/headless seam (the harness runs as the sandbox guest, not as $AdminAccount).
+if (-not $Unattended) {
+    try {
+        $currentId  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $isElevated = ([System.Security.Principal.WindowsPrincipal]$currentId).IsInRole(
+            [System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        $isElevated = $false
+    }
+    if (-not $isElevated) {
+        $msg = 'setup.ps1 must run elevated (as Administrator). Aborting before any change.'
+        Write-Log 'FATAL' $msg
+        [System.Windows.Forms.MessageBox]::Show($msg, 'Setup - not elevated', 'OK', 'Error') | Out-Null
+        exit 2
+    }
+    if ($env:USERNAME -ine $AdminAccount) {
+        $msg = "setup.ps1 must run as the bootstrap admin '$AdminAccount', " +
+               "but the current user is '$env:USERNAME'. Aborting before any change."
+        Write-Log 'FATAL' $msg
+        [System.Windows.Forms.MessageBox]::Show($msg, 'Setup - wrong account', 'OK', 'Error') | Out-Null
+        exit 2
+    }
+    Write-Log 'OK' "Context guard passed: elevated, running as $env:USERNAME"
+}
+
+# OPTIONAL config: if config.ps1 omits it, create it as $null so StrictMode does not blow up
+# later (e.g. `if ($WifiSSID)` indexes the missing variable and is FATAL under StrictMode).
+# All of these are used under a guard (`if ($Var)`) or validated at the point of use.
+$OptionalConfig = @('WifiSSID', 'WifiPass',
+                    'WallpaperFile', 'WallpaperByDomain', 'StaticPrefixLength', 'StaticGateway', 'DnsServers',
+                    'PathCloudAgent', 'CloudAgentInstaller', 'CloudAgentInstallDir',
+                    'PathVPN', 'Bookmarks', 'DesktopShortcutBookmarks')
+foreach ($o in $OptionalConfig) {
+    if (-not (Get-Variable -Name $o -ErrorAction SilentlyContinue)) {
+        New-Variable -Name $o -Value $null
+    }
+}
+
+# ============================================================
+# Pre-form data load (reads only - NO machine mutation here)
+# ============================================================
+# OEM activation, admin-password rotation, WiFi and the Ninite launch used to run
+# HERE, before the form. They mutate the machine, so they moved into PHASE A (below), which only
+# runs after the operator confirms - a Cancel must change nothing. The one thing still needed
+# before the form is the read-only data the form renders (printers).
+
+# Load printers.json from the USB. The parse+filter now lives in Read-PrinterList (above the
+# -LoadOnly seam) so it is unit-tested; see that function for the 5.1 array-collapse and BOM-decode
+# rationale. Logging stays here so the function is kept pure.
+$Printers = @()
+# Set when printers.json exists but yields nothing usable (parse error, or every entry dropped).
+# A legitimately printer-less deploy (no printers.json) is NOT a failure, so it stays $false there.
+$PrinterLoadFailed = $false
+$PrintersJson = Join-Path $ScriptDir 'printers.json'
+if (Test-Path $PrintersJson) {
+    try {
+        $result   = Read-PrinterList -Path $PrintersJson
+        $Printers = $result.Printers
+        foreach ($d in $result.Dropped) { Write-Log 'WARN' "printer '$($d.name)' ignored: $($d.reason)" }
+        Write-Log 'OK' "$($Printers.Count) printers loaded"
+        if ($Printers.Count -eq 0) { $PrinterLoadFailed = $true }   # file present but nothing selectable
+    } catch {
+        Write-Log 'ERROR' "printers.json: $($_.Exception.Message)"
+        $PrinterLoadFailed = $true
+    }
+} else {
+    Write-Log 'WARN' "printers.json not found on the USB"
+}
+
+# ============================================================
+# PHASE 3 - Collect inputs (modal input form) or resolve from -Test* params
+# ============================================================
+# Interactive: a MODAL input form (ShowDialog = real message loop, rock-solid - no DoEvents).
+# It only collects values, then closes. The live progress window is launched afterwards in a
+# separate runspace (see Start-ProgressWindow). Headless ($Unattended / no desktop): values
+# come from -Test* params and no window is shown.
+
+$useUI = (-not $Unattended) -and [System.Environment]::UserInteractive
+
+# No desktop but -Unattended not set: the form silently never shows and -Test* params drive the
+# run. Surface it so a technician who expected the GUI isn't confused by a "headless" provision.
+if (-not $useUI -and -not $Unattended) {
+    Write-Log 'WARN' 'No interactive desktop (UserInteractive=False) and -Unattended not set; running headless with -Test* parameters.'
+}
+
+# Surface a printers.json load failure to the technician BEFORE the form opens - otherwise an empty
+# printer dropdown looks intentional and the machine silently ships with no printer configured.
+if ($useUI -and $PrinterLoadFailed) {
+    [System.Windows.Forms.MessageBox]::Show(
+        "printers.json failed to load or contained no valid printers.`n`nThe printer list will be empty. If this machine needs a printer, check the file on the USB (JSON syntax, text encoding, and IP format) before continuing.",
+        'Setup - printers not loaded', 'OK', 'Warning') | Out-Null
+}
+
+if ($useUI) {
+try {
+
+# --- palette and fonts ---
+$ClrBg      = [System.Drawing.Color]::FromArgb(245, 246, 248)
+$ClrCard    = [System.Drawing.Color]::White
+$ClrText    = [System.Drawing.Color]::FromArgb(32, 32, 32)
+$ClrMuted   = [System.Drawing.Color]::FromArgb(110, 115, 125)
+$ClrAccent  = [System.Drawing.Color]::FromArgb(0, 120, 215)
+$ClrAccentD = [System.Drawing.Color]::FromArgb(0, 102, 184)
+$ClrReq     = [System.Drawing.Color]::FromArgb(200, 40, 40)
+$FontBase   = New-Object System.Drawing.Font('Segoe UI', 9)
+$FontH1     = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+$FontGroup  = New-Object System.Drawing.Font('Segoe UI', 9.5, [System.Drawing.FontStyle]::Bold)
+
+$Form = New-Object System.Windows.Forms.Form
+$Form.Text            = 'New Machine Setup'
+$Form.StartPosition   = 'CenterScreen'
+$Form.FormBorderStyle = 'FixedDialog'
+$Form.MaximizeBox     = $false
+$Form.MinimizeBox     = $false
+$Form.BackColor       = $ClrBg
+$Form.ForeColor       = $ClrText
+$Form.Font            = $FontBase
+
+$CW  = 544          # client width
+$gx  = 16           # group left margin
+$gw  = 528          # group width
+$Tip = New-Object System.Windows.Forms.ToolTip
+# Marks invalid fields with an inline glyph (used by the aggregated submit validator).
+# Not parented to the form, so Form.Dispose() won't free it - harmless in this one-shot flow.
+$ErrProvider = New-Object System.Windows.Forms.ErrorProvider
+$ErrProvider.BlinkStyle = [System.Windows.Forms.ErrorBlinkStyle]::NeverBlink
+
+# --- header band ---
+$Header = New-Object System.Windows.Forms.Panel
+$Header.Location  = New-Object System.Drawing.Point(0, 0)
+$Header.Size      = New-Object System.Drawing.Size($CW, 70)
+$Header.BackColor = $ClrCard
+$Form.Controls.Add($Header)
+$AccentBar = New-Object System.Windows.Forms.Panel
+$AccentBar.Location  = New-Object System.Drawing.Point(0, 0)
+$AccentBar.Size      = New-Object System.Drawing.Size(6, 70)
+$AccentBar.BackColor = $ClrAccent
+$Header.Controls.Add($AccentBar)
+$LblTitle = New-Object System.Windows.Forms.Label
+$LblTitle.Text = 'New Machine Setup'; $LblTitle.Font = $FontH1
+$LblTitle.ForeColor = $ClrText; $LblTitle.AutoSize = $true
+$LblTitle.Location = New-Object System.Drawing.Point(20, 12)
+$Header.Controls.Add($LblTitle)
+$LblSub = New-Object System.Windows.Forms.Label
+$LblSub.Text = 'Fill in the ticket details to provision the computer.'
+$LblSub.Font = $FontBase; $LblSub.ForeColor = $ClrMuted; $LblSub.AutoSize = $true
+$LblSub.Location = New-Object System.Drawing.Point(22, 42)
+$Header.Controls.Add($LblSub)
+
+$y = 82
+
+# Guards against TextChanged recursion when a handler programmatically sets .Text.
+$script:SuppressUser = $false
+$script:SuppressIp   = $false
+$script:SuppressName = $false
+$script:IpPrevLen    = 0
+
+# --- group: User ---
+$gUser = New-Group 'User' $gx $y $gw 288
+$py = 28
+# --- Full name: First | Last side by side, divided by a bar. Tab flows left->right then down.
+# Tab order == control add-order (the form sets NO explicit TabIndex anywhere); keep First added
+# before Last before Username or the tab flow silently breaks. The read-only field below shows the
+# Title-Cased concatenation that is actually used downstream ($TxtFullName).
+$nameColW   = 240
+$nameRightX = 16 + $nameColW + 16    # left col 16..256, 16px gap, right col 272..512
+
+$lblFirst = New-Object System.Windows.Forms.Label
+$lblFirst.Text = 'First name'; $lblFirst.AutoSize = $true; $lblFirst.ForeColor = $ClrMuted; $lblFirst.Font = $FontBase
+$lblFirst.Location = New-Object System.Drawing.Point(16, $py)
+$gUser.Controls.Add($lblFirst)
+$starFirst = New-Object System.Windows.Forms.Label
+$starFirst.Text = ' *'; $starFirst.AutoSize = $true; $starFirst.ForeColor = $ClrReq; $starFirst.Font = $FontBase
+$starFirst.Location = New-Object System.Drawing.Point((16 + $lblFirst.PreferredWidth - 4), $py)
+$gUser.Controls.Add($starFirst)
+$TxtFirstName = New-TextBox $nameColW
+$TxtFirstName.Location = New-Object System.Drawing.Point(16, ($py + 20))
+$Tip.SetToolTip($TxtFirstName, 'First name as written on the ticket.')
+$gUser.Controls.Add($TxtFirstName)
+
+# vertical divider bar, centered in the gap between the two columns
+$NameBar = New-Object System.Windows.Forms.Panel
+$NameBar.Size = New-Object System.Drawing.Size(2, 25)
+$NameBar.Location = New-Object System.Drawing.Point((16 + $nameColW + 7), ($py + 20))
+$NameBar.BackColor = $ClrMuted
+$gUser.Controls.Add($NameBar)
+
+$lblLast = New-Object System.Windows.Forms.Label
+$lblLast.Text = 'Last name'; $lblLast.AutoSize = $true; $lblLast.ForeColor = $ClrMuted; $lblLast.Font = $FontBase
+$lblLast.Location = New-Object System.Drawing.Point($nameRightX, $py)
+$gUser.Controls.Add($lblLast)
+$starLast = New-Object System.Windows.Forms.Label
+$starLast.Text = ' *'; $starLast.AutoSize = $true; $starLast.ForeColor = $ClrReq; $starLast.Font = $FontBase
+$starLast.Location = New-Object System.Drawing.Point(($nameRightX + $lblLast.PreferredWidth - 4), $py)
+$gUser.Controls.Add($starLast)
+$TxtLastName = New-TextBox $nameColW
+$TxtLastName.Location = New-Object System.Drawing.Point($nameRightX, ($py + 20))
+$Tip.SetToolTip($TxtLastName, 'Last name (surname) as written on the ticket.')
+$gUser.Controls.Add($TxtLastName)
+$py = $py + 20 + 25 + 12
+
+# Read-only output: the two names concatenated and Title-Cased (the display name actually used).
+$lblFull = New-Object System.Windows.Forms.Label
+$lblFull.Text = 'Full name (auto)'; $lblFull.AutoSize = $true; $lblFull.ForeColor = $ClrMuted; $lblFull.Font = $FontBase
+$lblFull.Location = New-Object System.Drawing.Point(16, $py)
+$gUser.Controls.Add($lblFull)
+$TxtFullName = New-TextBox
+$TxtFullName.ReadOnly  = $true
+$TxtFullName.TabStop   = $false
+$TxtFullName.BackColor = $ClrBg
+$TxtFullName.Location  = New-Object System.Drawing.Point(16, ($py + 20))
+$gUser.Controls.Add($TxtFullName)
+$py = $py + 20 + 25 + 12
+
+# Live: sanitize each field (letters/space/hyphen/apostrophe), then refresh the concatenation.
+# Inputs keep raw casing; the read-only output above is the source of truth (Title Case). The
+# concat is always "First Last" (never flipped). Shared SuppressName guard is safe: each handler
+# only sets its OWN box, and $TxtFullName has no TextChanged so the concat write cannot recurse.
+# Username is auto-derived from First+Last (firstname.surname) so the technician never types it;
+# it stays editable - once they type in the Username box (KeyDown below), auto-fill backs off.
+$script:UserEditedUsername = $false
+# Set only while WE write the Username programmatically, so its TextChanged can tell an auto-fill
+# apart from a real edit (a physical text change should stop the auto-sync - arrow/nav keys must not).
+$script:AutoFillUser = $false
+$TxtFirstName.Add_TextChanged({
+    if ($script:SuppressName) { return }
+    $raw   = $TxtFirstName.Text
+    $clean = [regex]::Replace($raw, "[^\p{L}\s\-']", '')
+    if ($clean -ne $raw) {
+        $caret = $TxtFirstName.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressName = $true
+        $TxtFirstName.Text = $clean
+        $script:SuppressName = $false
+        $TxtFirstName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
+    $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
+    if (-not $script:UserEditedUsername) { $script:AutoFillUser = $true; $TxtUsername.Text = Format-Username $TxtFirstName.Text $TxtLastName.Text; $script:AutoFillUser = $false }
+})
+$TxtLastName.Add_TextChanged({
+    if ($script:SuppressName) { return }
+    $raw   = $TxtLastName.Text
+    $clean = [regex]::Replace($raw, "[^\p{L}\s\-']", '')
+    if ($clean -ne $raw) {
+        $caret = $TxtLastName.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressName = $true
+        $TxtLastName.Text = $clean
+        $script:SuppressName = $false
+        $TxtLastName.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
+    $TxtFullName.Text = Format-FullName ("{0} {1}" -f $TxtFirstName.Text, $TxtLastName.Text)
+    if (-not $script:UserEditedUsername) { $script:AutoFillUser = $true; $TxtUsername.Text = Format-Username $TxtFirstName.Text $TxtLastName.Text; $script:AutoFillUser = $false }
+})
+$TxtUsername = New-TextBox
+$Tip.SetToolTip($TxtUsername, 'Auto-filled from First + Last (e.g. joao.silva). Edit only if you need a different login.')
+$py = Add-Field $gUser 'Username (auto from name)' $TxtUsername 16 $py $true
+# A real EDIT here (the text actually changing) means the technician is overriding the auto-derived
+# value: stop syncing it from the name fields. This is detected in the TextChanged handler below by
+# excluding our own programmatic auto-fill writes ($script:AutoFillUser). It used to latch on KeyDown,
+# which ALSO fired on pure navigation keys (arrows/Home/End/Tab) and permanently killed the auto-fill.
+# Live cleanup: strip accents (o-acute -> o, c-cedilla -> c) BEFORE filtering so the letter
+# survives, force lowercase, keep only [a-z.], collapse repeated dots. Caret-preserving.
+# Registered BEFORE the email-preview handler (below) so the preview sees the cleaned text.
+# Full name.surname shape is enforced at submit time (Test-Username in the OK handler).
+$TxtUsername.Add_TextChanged({
+    if ($script:SuppressUser) { return }
+    # A change that is NOT our programmatic auto-fill is a real edit -> stop auto-syncing from the
+    # name fields (navigation keys never reach here because they do not change the text).
+    if (-not $script:AutoFillUser) { $script:UserEditedUsername = $true }
+    $raw   = $TxtUsername.Text
+    $clean = Remove-Diacritics $raw
+    $clean = [regex]::Replace($clean.ToLower(), '[^a-z.]', '')
+    $clean = [regex]::Replace($clean, '\.{2,}', '.')
+    if ($clean -ne $raw) {
+        $caret = $TxtUsername.SelectionStart - ($raw.Length - $clean.Length)
+        $script:SuppressUser = $true
+        $TxtUsername.Text = $clean
+        $script:SuppressUser = $false
+        $TxtUsername.SelectionStart = [Math]::Min([Math]::Max($caret, 0), $clean.Length)
+    }
+})
+$CmbDomain = New-Combo 250
+$EmailDomains | ForEach-Object { $CmbDomain.Items.Add($_) | Out-Null }
+$CmbDomain.SelectedIndex = 0
+$py = Add-Field $gUser 'Email domain' $CmbDomain 16 $py
+$LblEmail = New-Object System.Windows.Forms.Label
+$LblEmail.AutoSize = $true; $LblEmail.ForeColor = $ClrAccent; $LblEmail.Font = $FontGroup
+$LblEmail.Location = New-Object System.Drawing.Point(16, $py); $LblEmail.Text = 'Email: ---'
+$gUser.Controls.Add($LblEmail)
+$y += 288 + 12
+
+# --- group: Network ---
+$gNet = New-Group 'Network' $gx $y $gw 92
+$RadioDhcp            = New-Object System.Windows.Forms.RadioButton
+$RadioDhcp.Text       = 'DHCP (automatic)'
+$RadioDhcp.AutoSize   = $true
+$RadioDhcp.Checked    = $true
+$RadioDhcp.Location   = New-Object System.Drawing.Point(16, 28)
+$RadioStatic          = New-Object System.Windows.Forms.RadioButton
+$RadioStatic.Text     = 'Static IP'
+$RadioStatic.AutoSize = $true
+$RadioStatic.Location = New-Object System.Drawing.Point(200, 28)
+$gNet.Controls.AddRange(@($RadioDhcp, $RadioStatic))
+$LblNetHint = New-Object System.Windows.Forms.Label
+$LblNetHint.Text = 'The IP address will be obtained automatically from the network.'
+$LblNetHint.AutoSize = $true; $LblNetHint.ForeColor = $ClrMuted; $LblNetHint.Font = $FontBase
+$LblNetHint.Location = New-Object System.Drawing.Point(16, 60)
+$gNet.Controls.Add($LblNetHint)
+$LblIp      = New-Object System.Windows.Forms.Label
+$LblIp.Text = 'IP (e.g. 10.0.X.X)'
+$LblIp.AutoSize = $true; $LblIp.ForeColor = $ClrMuted; $LblIp.Font = $FontBase
+$LblIp.Location = New-Object System.Drawing.Point(16, 60)
+$LblIp.Visible  = $false
+$TxtIp          = New-TextBox 180
+$TxtIp.Location = New-Object System.Drawing.Point(150, 57)
+$TxtIp.Visible  = $false
+$gNet.Controls.AddRange(@($LblIp, $TxtIp))
+
+$RadioStatic.Add_CheckedChanged({
+    $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
+    $LblNetHint.Visible = -not $RadioStatic.Checked })
+$RadioDhcp.Add_CheckedChanged({
+    $LblIp.Visible = $RadioStatic.Checked; $TxtIp.Visible = $RadioStatic.Checked
+    $LblNetHint.Visible = -not $RadioStatic.Checked })
+
+# IP input mask. KeyPress blocks non-digit/non-dot while typing; KeyDown makes Enter jump to
+# the next octet; TextChanged normalizes (also catches paste). The auto-dot fires only while
+# TYPING (not when deleting), so backspace can fix mistakes. SuppressIp guards recursion.
+$TxtIp.Add_KeyPress({ param($s, $e)
+    if ([char]::IsControl($e.KeyChar)) { return }   # let backspace/delete through
+    if ($e.KeyChar -ne '.' -and -not [char]::IsDigit($e.KeyChar)) { $e.Handled = $true }
+})
+# Enter = commit the current octet and jump to the next one (inserts the dot). SuppressKeyPress
+# stops the bell; there is no AcceptButton, so nothing gets submitted.
+$TxtIp.Add_KeyDown({ param($s, $e)
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+        $e.SuppressKeyPress = $true; $e.Handled = $true
+        $t = $TxtIp.Text
+        if ($t -and -not $t.EndsWith('.') -and (($t -split '\.').Count -lt 4)) {
+            $script:SuppressIp = $true
+            $TxtIp.Text = "$t."
+            $script:SuppressIp = $false
+            $TxtIp.SelectionStart = $TxtIp.Text.Length
+            $script:IpPrevLen = $TxtIp.Text.Length
+        }
+    }
+})
+$TxtIp.Add_TextChanged({
+    if ($script:SuppressIp) { return }
+    $raw   = $TxtIp.Text
+    $caret = $TxtIp.SelectionStart
+    $grew  = $raw.Length -gt $script:IpPrevLen   # typing grows; deleting shrinks -> no re-pad
+    $s = [regex]::Replace($raw, '[^\d.]', '')
+    $s = [regex]::Replace($s, '\.{2,}', '.')
+    $out = [System.Collections.Generic.List[string]]::new()
+    foreach ($p in ($s -split '\.')) {
+        if ($out.Count -ge 4) { break }
+        $oct = if ($p.Length -gt 3) { $p.Substring(0, 3) } else { $p }
+        if ($oct -ne '' -and [int]$oct -gt 255) { $oct = '255' }
+        $out.Add($oct)
+    }
+    $r = ($out -join '.')
+    if ($grew -and $out.Count -lt 4 -and $out.Count -gt 0 -and $out[$out.Count - 1].Length -eq 3 -and -not $raw.EndsWith('.')) {
+        $r += '.'
+    }
+    if ($r -ne $raw) {
+        $delta = $r.Length - $raw.Length
+        $script:SuppressIp = $true
+        $TxtIp.Text = $r
+        $script:SuppressIp = $false
+        $TxtIp.SelectionStart = [Math]::Min([Math]::Max($caret + $delta, 0), $r.Length)
+    }
+    $script:IpPrevLen = $TxtIp.Text.Length
+})
+$y += 92 + 12
+
+# --- group: Peripherals and applications ---
+# One checkbox per corp link, so the group grows by 26px for each link past the first (the
+# original 178px height budgeted a single bookmark row after WebAgent + VPN). Filter nulls:
+# a config.ps1 without $Bookmarks leaves it $null (OptionalConfig), and @($null) is a ONE-element
+# array whose .Name below would throw under StrictMode and kill the GUI.
+$BmList = @($Bookmarks | Where-Object { $_ })
+$gPerH  = 178 + ([Math]::Max($BmList.Count, 1) - 1) * 26
+$gPer = New-Group 'Peripherals and applications' $gx $y $gw $gPerH
+$py = 28
+$CmbPrinter = New-Combo
+# DropDownList (New-Combo default), same UX as the signature combos below: click the bar or
+# the arrow to open, type the first letter to jump, or scroll. Index 0 = (None).
+$CmbPrinter.Items.Add('(None)') | Out-Null
+foreach ($p in $Printers) { $CmbPrinter.Items.Add("$($p.name) - $($p.model) [$($p.ip)]") | Out-Null }
+$CmbPrinter.SelectedIndex = 0
+$py = Add-Field $gPer 'Main printer' $CmbPrinter 16 $py
+$ChkWebAgent          = New-Object System.Windows.Forms.CheckBox
+$ChkWebAgent.Text     = 'Will this PC use the corporate ERP? (downloads + installs WebAgent)'
+$ChkWebAgent.AutoSize = $true
+$ChkWebAgent.Location = New-Object System.Drawing.Point(16, $py)
+$Tip.SetToolTip($ChkWebAgent, 'Downloads and installs the WebAgent required to access the corporate ERP on this machine.')
+$gPer.Controls.Add($ChkWebAgent)
+$ChkVpn          = New-Object System.Windows.Forms.CheckBox
+$ChkVpn.Text     = 'Will this PC use the VPN? (installs OpenVPN + imports the profile)'
+$ChkVpn.AutoSize = $true
+$ChkVpn.Location = New-Object System.Drawing.Point(16, ($py + 26))
+$Tip.SetToolTip($ChkVpn, 'Installs OpenVPN and imports the corp profile into this user. You still connect manually (user/password).')
+$gPer.Controls.Add($ChkVpn)
+# One checkbox per corp link (name from config so the repo stays generic). Each toggles ONLY its
+# own link across all three browsers; the selection flows through Select-EnabledBookmarks.
+$BookmarkChecks = @()
+for ($bi = 0; $bi -lt $BmList.Count; $bi++) {
+    $chk          = New-Object System.Windows.Forms.CheckBox
+    $chk.Text     = 'Add bookmark: {0}' -f [string]$BmList[$bi].Name
+    $chk.AutoSize = $true
+    $chk.Location = New-Object System.Drawing.Point(16, ($py + 52 + ($bi * 26)))
+    $Tip.SetToolTip($chk, 'Adds this link loose on the bookmarks bar of Chrome, Edge and Firefox for the new user.')
+    $gPer.Controls.Add($chk)
+    $BookmarkChecks += $chk
+}
+$y += $gPerH + 12
+
+# --- group: Email signature ---
+$gSig = New-Group 'Email signature' $gx $y $gw 140
+$py = 28
+$CmbSector = New-Combo
+$py = Add-Field $gSig 'Sector' $CmbSector 16 $py
+$CmbSigTemplate = New-Combo
+$CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+$CmbSigTemplate.SelectedIndex = 0
+$py = Add-Field $gSig 'Template (.htm)' $CmbSigTemplate 16 $py
+$y += 140 + 16
+
+# --- footer buttons ---
+$BtnCancel = New-Object System.Windows.Forms.Button
+$BtnCancel.Text = 'Cancel'
+$BtnCancel.Size = New-Object System.Drawing.Size(120, 38)
+$BtnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnCancel.BackColor = $ClrCard; $BtnCancel.ForeColor = $ClrText
+$BtnCancel.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(200, 205, 212)
+$BtnCancel.Location = New-Object System.Drawing.Point(16, $y)
+$BtnCancel.Cursor = [System.Windows.Forms.Cursors]::Hand
+$BtnCancel.Add_Click({ $Form.Close() })
+$Form.Controls.Add($BtnCancel)
+
+$BtnOk          = New-Object System.Windows.Forms.Button
+$BtnOk.Text     = 'Start setup'
+$BtnOk.Size     = New-Object System.Drawing.Size(264, 38)
+$BtnOk.Font     = $FontGroup
+$BtnOk.Location = New-Object System.Drawing.Point(($gx + $gw - 264), $y)
+$BtnOk.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnOk.BackColor = $ClrAccent
+$BtnOk.ForeColor = [System.Drawing.Color]::White
+$BtnOk.FlatAppearance.BorderSize          = 0
+$BtnOk.FlatAppearance.MouseOverBackColor  = $ClrAccentD
+$BtnOk.FlatAppearance.MouseDownBackColor  = [System.Drawing.Color]::FromArgb(0, 90, 158)
+$BtnOk.Cursor    = [System.Windows.Forms.Cursors]::Hand
+$y += 38 + 16
+$BtnOk.Add_Click({
+    # Aggregate ALL field errors into one message + per-field glyphs, instead of return-on-first.
+    $errs = [System.Collections.Generic.List[string]]::new()
+    $ErrProvider.Clear()
+    if ((Format-FullName $TxtFullName.Text) -eq '') {
+        $errs.Add('Full name: fill in first and last name - letters only (hyphens and apostrophes OK, no digits). Example: Joao Silva.')
+        $ErrProvider.SetError($TxtFirstName, 'Fill first/last name - letters only.')
+    }
+    $un = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
+    if (-not (Test-Username $un)) {
+        $errs.Add('Username must be firstname.surname - all lowercase, with a single dot between the two names, no numbers or spaces (example: joao.silva). It becomes the Windows login and the e-mail address, so it has to be exact.')
+        $ErrProvider.SetError($TxtUsername, 'Use firstname.surname (lowercase, one dot). Ex: joao.silva')
+    }
+    if ($RadioStatic.Checked -and -not (Test-Ipv4 $TxtIp.Text)) {
+        $errs.Add('Static IP: four numbers from 0 to 255 separated by dots. Example: 10.0.1.50.')
+        $ErrProvider.SetError($TxtIp, 'Four numbers 0-255 with dots. Ex: 10.0.1.50')
+    }
+    if ($errs.Count -gt 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Some fields need fixing before we can start:`n`n - " + ($errs -join "`n - "),
+            'Setup - check the form', 'OK', 'Warning') | Out-Null
+        return
+    }
+    $Form.Tag = 'OK'
+    $Form.Close()
+})
+$Form.Controls.Add($BtnOk)
+
+# Event: domain changes -> reload sectors
+$CmbDomain.Add_SelectedIndexChanged({
+    if ($CmbDomain.SelectedIndex -lt 0) { return }
+    $d  = $CmbDomain.SelectedItem.ToString()
+    $dp = Join-Path $PathSignatures $d
+    $CmbSector.Items.Clear()
+    if (Test-Path $dp) {
+        $dirs = @(Get-ChildItem -Path $dp -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+        if ($dirs.Count -gt 0) { $dirs | ForEach-Object { $CmbSector.Items.Add($_) | Out-Null } }
+        else { $CmbSector.Items.Add('(No sectors)') | Out-Null }
+    } else {
+        $CmbSector.Items.Add('(Folder not found)') | Out-Null
+    }
+    if ($CmbSector.Items.Count -gt 0) { $CmbSector.SelectedIndex = 0 }
+})
+
+# Event: sector changes -> reload available .htm files
+$CmbSector.Add_SelectedIndexChanged({
+    if ($CmbSector.SelectedIndex -lt 0 -or -not $CmbDomain.SelectedItem) { return }
+    $d = $CmbDomain.SelectedItem.ToString()
+    $s = $CmbSector.SelectedItem.ToString()
+    $CmbSigTemplate.Items.Clear()
+    $CmbSigTemplate.Items.Add('(Automatic - first found)') | Out-Null
+    if ($s -notmatch '^\(') {
+        $sp = Join-Path (Join-Path $PathSignatures $d) $s
+        if (Test-Path $sp) {
+            Get-ChildItem -Path $sp -Filter '*.htm' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notmatch '^[._]' } |
+                ForEach-Object { $CmbSigTemplate.Items.Add($_.Name) | Out-Null }
+        }
+    }
+    $CmbSigTemplate.SelectedIndex = 0
+})
+
+# Initial load: fire the domain event to populate sectors and templates
+$CmbDomain.SelectedIndex = -1
+$CmbDomain.SelectedIndex = 0
+
+# Real-time email preview (username@domain). Registered after the initial load so it does not
+# fire during population; called once explicitly to set the starting text.
+$UpdateEmail = {
+    $u = $TxtUsername.Text.Trim().ToLower()
+    $d = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { '' }
+    $LblEmail.Text = if ($u) { "Email: $u@$d" } else { 'Email: ---' }
+}
+$TxtUsername.Add_TextChanged($UpdateEmail)
+$CmbDomain.Add_SelectedIndexChanged($UpdateEmail)
+& $UpdateEmail
+
+# Size the window height to the assembled content (grouped layout builds $y as it goes). Cap it to
+# the usable screen and enable AutoScroll so the footer (Start button + the per-bookmark checkboxes)
+# is always reachable: on a low-res display - or before the video driver loads in a fresh install -
+# $y can exceed the screen height, which pushed the bottom controls off-screen. When the content
+# overflows we widen the client area by the scrollbar width so only a VERTICAL scrollbar appears
+# (no horizontal one); when it fits, the size is exactly as before.
+$Form.AutoScroll = $true
+$maxClientH = [Math]::Max(400, [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Height - 60)
+if ($y -gt $maxClientH) {
+    $sbw = [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth
+    $Form.ClientSize = New-Object System.Drawing.Size(($CW + $sbw), $maxClientH)
+} else {
+    $Form.ClientSize = New-Object System.Drawing.Size($CW, $y)
+}
+
+$Form.ShowDialog() | Out-Null
+
+if ($Form.Tag -ne 'OK') {
+    Write-Log 'WARN' "Setup cancelled (input form closed)"
+    exit 0
+}
+
+$FullName        = Format-FullName $TxtFullName.Text
+$Username        = (Remove-Diacritics $TxtUsername.Text).Trim().ToLower()
+$EmailDomain     = if ($CmbDomain.SelectedItem) { $CmbDomain.SelectedItem.ToString() } else { $EmailDomains[0] }
+$Email           = "$Username@$EmailDomain"
+$UseStatic       = $RadioStatic.Checked
+$StaticIp        = if ($UseStatic) { $TxtIp.Text.Trim() } else { '' }
+# DropDownList: index 0 = (None); items 1..N map to $Printers[0..N-1].
+$PrinterIdx      = $CmbPrinter.SelectedIndex
+$SelectedPrinter = if ($PrinterIdx -gt 0) { $Printers[$PrinterIdx - 1] } else { $null }
+$SectorName      = if ($CmbSector.SelectedItem) { $CmbSector.SelectedItem.ToString() } else { '' }
+$SigTemplate     = if ($CmbSigTemplate.SelectedItem) { $CmbSigTemplate.SelectedItem.ToString() } else { '(Automatic - first found)' }
+$InstallWebAgent = $ChkWebAgent.Checked
+$InstallVpn      = $ChkVpn.Checked
+$BookmarkFlags   = @($BookmarkChecks | ForEach-Object { $_.Checked })
+
+} catch {
+    Write-Log 'FATAL' "Input GUI failed: $($_.Exception.Message)"
+    [System.Windows.Forms.MessageBox]::Show(
+        "Fatal GUI error:`n$($_.Exception.Message)",
+        'Setup - Fatal Error', 'OK', 'Error') | Out-Null
+    exit 1
+}
+
+} else {
+    $EmailDomain     = if ($TestDomain) { $TestDomain } else { $EmailDomains[0] }
+    $FullName        = $TestFullName
+    $Username        = $TestUsername.ToLower()
+    $Email           = "$Username@$EmailDomain"
+    $UseStatic       = $TestStaticIp.IsPresent
+    $StaticIp        = if ($UseStatic) { $TestIpAddress } else { '' }
+    $SelectedPrinter = if ($Printers.Count -gt 0) { $Printers[0] } else { $null }
+
+    $sigDomainPath = Join-Path $PathSignatures $EmailDomain
+    $SectorName    = if ($TestSector) {
+        $TestSector
+    } elseif (Test-Path $sigDomainPath) {
+        (Get-ChildItem $sigDomainPath -Directory -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty Name)
+    } else { '' }
+
+    $SigTemplate     = '(Automatic - first found)'
+    $InstallWebAgent = $TestWebAgent.IsPresent
+    $InstallVpn      = $TestVpn.IsPresent
+    $BookmarkFlags   = @($TestBookmark0.IsPresent, $TestBookmark1.IsPresent)
+}
+
+# Converge both paths: the corp links whose per-link box/switch is ticked. Tolerates a $null
+# $Bookmarks (OptionalConfig default) and any flag/list length mismatch.
+# @() wrap is load-bearing: a zero-pick emits AutomationNull, which would bind $null to
+# New-CorpStateObject's [object[]] and serialize as "Bookmarks": null (Phase B then logged a
+# spurious ERROR on every zero-bookmark provision). @(AutomationNull) is a real empty array.
+$SelectedBookmarks = @(Select-EnabledBookmarks -Bookmarks $Bookmarks -Flags $BookmarkFlags)
+
+# Final defensive validation - the single point both paths (GUI + headless -Test*) converge on.
+# The headless path builds these straight from parameters with no GUI validation, so re-check
+# here: a malformed -TestUsername aborts with a clear FATAL before any New-LocalUser.
+$FullName = Format-FullName $FullName
+$Username = (Remove-Diacritics $Username).Trim().ToLower()
+$Email    = "$Username@$EmailDomain"
+$capErrs  = [System.Collections.Generic.List[string]]::new()
+if (-not $FullName)                              { $capErrs.Add("Full name has no usable letters: '$FullName'") }
+if (-not (Test-Username $Username))              { $capErrs.Add("Username not name.surname: '$Username'") }
+if ($UseStatic -and -not (Test-Ipv4 $StaticIp))  { $capErrs.Add("Static IP invalid: '$StaticIp'") }
+if ($capErrs.Count -gt 0) {
+    $m = "Input validation failed:`n - " + ($capErrs -join "`n - ")
+    Write-Log 'FATAL' $m
+    if ($useUI) { [System.Windows.Forms.MessageBox]::Show($m, 'Setup - invalid input', 'OK', 'Error') | Out-Null }
+    exit 1
+}
+
+# Launch the live progress window now (interactive only). From here, every Write-Log streams
+# into it. The work below runs on THIS thread; the window has its own thread + message loop.
+# The window is COSMETIC: if it fails to launch (e.g. STA thread error), degrade to file+host
+# logging - never abort a machine provision over a progress window. Resetting the three UI
+# vars to $null makes the rest of the run behave exactly like the headless path.
+if ($useUI) {
+    try {
+        Start-ProgressWindow
+    } catch {
+        Write-Log 'WARN' "Progress window failed to launch (continuing without it): $($_.Exception.Message)"
+        $script:LogQueue = $null
+        $script:UiState  = $null
+        $script:ProgUI   = $null
+    }
+}
+
+Write-Log 'INFO' "Mode: $(if ($useUI) { 'interactive' } else { 'unattended' })"
+Write-Log 'INFO' "Name=$FullName | User=$Username | Email=$Email"
+Write-Log 'INFO' "Network=$(if ($UseStatic) { "Static $StaticIp" } else { 'DHCP' })"
+Write-Log 'INFO' "Printer=$(if ($SelectedPrinter) { $SelectedPrinter.name } else { 'None' })"
+Write-Log 'INFO' "Sector=$SectorName | Template=$SigTemplate | WebAgent=$InstallWebAgent"
+
+# ============================================================
+# PHASE A - machine-scope provisioning (FIRST point that mutates the machine)
+# ============================================================
+# Everything above only READ config/printers and collected inputs; a Cancel on the form exited 0
+# having changed nothing. From here down the machine is mutated, so these steps run ONLY after the
+# operator confirmed (form OK) or in headless mode - never on Cancel. This kills the old
+# "cancel after mutations -> exit 0 on a half-changed machine" bug.
+# Progress marker for power-loss recovery (audit C1): records how far Phase A got and, crucially,
+# whether the admin password was already rotated - so a machine that lost power mid-Phase-A can be
+# diagnosed instead of leaving the technician guessing whether the admin password is still the
+# fleet-wide bootstrap one or the config value. Best-effort and atomic (temp + Move); never fatal.
+function Set-PhaseAState {
+    param([Parameter(Mandatory)][string]$State)
+    try {
+        $dir = Join-Path $env:ProgramData 'CorpSetup'
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $f = Join-Path $dir 'phase-a.state'
+        Set-Content -LiteralPath "$f.tmp" -Value ("{0}" -f $State) -Encoding UTF8 -Force
+        Move-Item -LiteralPath "$f.tmp" -Destination $f -Force
+    } catch { }
+}
+
+Set-Phase 'Phase A - activation, admin password, network base, installers'
+Set-PhaseAState 'phase-a-started; admin password = bootstrap (not yet rotated)'
+
+# Activate Windows with the OEM key from the UEFI firmware (Dell OA3)
+try {
+    $oemKey = (Get-CimInstance SoftwareLicensingService -ErrorAction Stop).OA3xOriginalProductKey
+    if ($oemKey -and $oemKey.Trim().Length -gt 0) {
+        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ipk $oemKey 2>&1 | Out-Null
+        # /ipk via cscript is synchronous (cscript waits for the script); /ato can follow directly.
+        cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato 2>&1 | Out-Null
+        Write-Log 'OK' "OEM firmware key applied and activation requested"
+    } else {
+        Write-Log 'WARN' "No OEM key found in the UEFI firmware"
+    }
+} catch {
+    # Activation is best-effort and never blocks provisioning (the machine works
+    # unactivated). A sandbox/VM has no firmware OEM key, so this WARNs rather than ERRORs
+    # to avoid failing the whole run on a non-critical step. Verify activation in the checklist.
+    Write-Log 'WARN' "OEM activation skipped/failed: $($_.Exception.Message)"
+}
+
+# Rotate the admin account bootstrap password ($AdminAccount, created by autounattend)
+# to the real password from config.ps1
+try {
+    # Log BEFORE and AFTER (audit C1): the pair pins down the password state even if power is lost
+    # right at the rotation, removing the "is it bootstrap or the new one?" ambiguity.
+    Write-Log 'INFO' "Rotating $AdminAccount password from the bootstrap value to the config value..."
+    $adminPass = ConvertTo-SecureString $AdminNewPass -AsPlainText -Force
+    Set-LocalUser -Name $AdminAccount -Password $adminPass -ErrorAction Stop
+    Set-PhaseAState 'admin-password-rotated; admin password = config value ($AdminNewPass)'
+    Write-Log 'OK' "$AdminAccount password updated (bootstrap removed; now the config value)"
+    # Clear any stale "not rotated" marker left by a previous failed run (run.bat re-run).
+    Remove-Item -LiteralPath (Join-Path $env:PUBLIC 'Desktop\ADMIN-PASSWORD-NOT-ROTATED.txt') -Force -ErrorAction SilentlyContinue
+    # The bootstrap password now lives only in autounattend.xml on the USB (base64-encoded, not
+    # encrypted) and in Windows' own copy at Panther\unattend.xml. It has been rotated, so both are
+    # dead weight + a credential on disk: scrub them. (config.ps1 stays - run.bat may re-run setup.)
+    foreach ($u in @((Join-Path $ScriptDir 'autounattend.xml'), "$env:WINDIR\Panther\unattend.xml")) {
+        if (Test-Path $u) {
+            try { Remove-Item -LiteralPath $u -Force -ErrorAction Stop; Write-Log 'OK' "Removed bootstrap credential file: $u" }
+            catch { Write-Log 'WARN' "Could not remove ${u}: $($_.Exception.Message)" }
+        }
+    }
+} catch {
+    $rotErr = $_.Exception.Message
+    Write-Log 'ERROR' "Rotate ${AdminAccount} password: $rotErr"
+    # Failing here leaves the machine on the fleet-wide BOOTSTRAP password. The MessageBox is
+    # suppressed under -Unattended and the log line scrolls away, so ALSO drop a durable marker on
+    # the Public Desktop: whoever receives the machine sees the admin password must be rotated by hand.
+    try {
+        $pwMarker = Join-Path $env:PUBLIC 'Desktop\ADMIN-PASSWORD-NOT-ROTATED.txt'
+        Set-Content -LiteralPath $pwMarker -Encoding UTF8 -Force -Value @"
+SECURITY: the $AdminAccount password was NOT rotated during setup.
+This machine is still on the shared BOOTSTRAP password from the USB.
+Change it before handing the machine over:  net user $AdminAccount *
+Error: $rotErr
+"@
+    } catch { Write-Log 'WARN' "Could not write the admin-password marker: $($_.Exception.Message)" }
+    if (-not $Unattended) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "FAILED TO ROTATE THE $AdminAccount PASSWORD.`n`nThe machine is on the BOOTSTRAP password. " +
+            "Change it manually BEFORE handing it over (e.g. net user $AdminAccount *).`n`nError: $rotErr",
+            'Setup - SECURITY RISK', 'OK', 'Error') | Out-Null
+    }
+}
+
+# WiFi (brings up internet for the Ninite download below). Full logic lives in Connect-CorpWifi:
+# readiness gate (WlanSvc + adapter), WPA3-SAE/WPA2 profile selection, add, connect, CIM verify.
+# Best-effort: a $false here is retried once just before the PHASE 7 installer join.
+if ($WifiSSID) {
+    $script:WifiConnected = Connect-CorpWifi -Ssid $WifiSSID -Passphrase ([string]$WifiPass)
+} else { Write-Log 'WARN' "WiFi skipped (WifiSSID empty)" }
+
+# Background-installer pool. Defined before first use; Ninite starts here (the longest installer)
+# and downloads while PHASE 4-6 run; the rest of the pool joins in PHASE 7. MSI mutex: Ninite and
+# WebAgent never overlap (WebAgent only runs in PHASE 7, after the pool). NOTE: Ninite used to be
+# launched pre-form to overlap form entry; it moved here so nothing mutates before the operator
+# confirms.
+$BgInstalls = [System.Collections.Generic.List[object]]::new()
+function Start-BgInstall {
+    param([string]$Name, [string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$OkCodes = @(0), [string]$WorkingDirectory, [switch]$Online)
+    $params = @{ FilePath = $FilePath; PassThru = $true }
+    if ($ArgumentList.Count) { $params['ArgumentList'] = $ArgumentList }
+    # ODT (and any installer that resolves source files relative to CWD) needs a deterministic
+    # working dir; without it Start-Process inherits whatever launched setup.ps1 (system32).
+    if ($WorkingDirectory) { $params['WorkingDirectory'] = $WorkingDirectory }
+    $proc = Start-Process @params
+    # -Online marks a network-dependent installer (Ninite/Office) so the PHASE 7 join can recognise a
+    # no-internet failure and retry it once if the link came up late. Keep the launch args for a retry.
+    $BgInstalls.Add([pscustomobject]@{ Name = $Name; Proc = $proc; OkCodes = $OkCodes; Online = [bool]$Online; FilePath = $FilePath; ArgumentList = $ArgumentList; WorkingDirectory = $WorkingDirectory })
+    Write-Log 'INFO' "$Name started in the background (PID $($proc.Id))"
+    return $proc
+}
+
+$NinitePath = Join-Path $ScriptDir 'ninite.exe'
+if (Test-Path $NinitePath) {
+    try { Start-BgInstall 'Ninite' $NinitePath -Online | Out-Null }
+    catch { Write-Log 'ERROR' "Ninite: $($_.Exception.Message)" }
+} else {
+    Write-Log 'WARN' "ninite.exe not found on the USB"
+}
+
+# ============================================================
+# PHASE 4 - Rename PC + create user + network + wallpaper
+# ============================================================
+Set-Phase 'Phase 4 - rename PC, create user, network, wallpaper'
+
+# Rename the PC to the BIOS serial
+try {
+    $sn = (Get-CimInstance Win32_BIOS -ErrorAction Stop).SerialNumber
+    if ($sn -and $sn.Trim().Length -gt 0 -and $sn -notmatch 'O\.E\.M\.|Default|System Serial|To Be Filled') {
+        $newName = $sn.Trim() -replace '[^A-Za-z0-9-]', ''
+        if ($newName.Length -gt 15) {
+            Write-Log 'WARN' "Serial '$newName' exceeds the 15-char NetBIOS limit; truncated to '$($newName.Substring(0, 15))'"
+            $newName = $newName.Substring(0, 15)
+        }
+        if ($env:COMPUTERNAME -eq $newName) {
+            Write-Log 'OK' "PC already named $newName"
+        } else {
+            Rename-Computer -NewName $newName -Force -ErrorAction Stop
+            Write-Log 'OK' "PC renamed to: $newName (effective after the next reboot)"
+        }
+    } else {
+        Write-Log 'WARN' "Invalid or generic serial: '$sn' - rename manually"
+    }
+} catch {
+    Write-Log 'ERROR' "Rename PC: $($_.Exception.Message)"
+}
+
+# Local user
+try {
+    # Defense in depth at the use site: never create an account with an invalid name
+    # (spaces/digits/uppercase would produce a broken or wrong Windows account).
+    if ($Username -match '[^a-z.]') { throw "Refusing to create user with invalid name: '$Username'" }
+    $SecPass = ConvertTo-SecureString $UserInitialPass -AsPlainText -Force
+    if (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) {
+        Write-Log 'OK' "User already exists: $Username"
+    } else {
+        # FullName (the display name on the lock screen / Start) = the login (joao.silva), NOT the
+        # title-cased "Joao Silva". The email SIGNATURE still uses the proper full name (via state.json).
+        New-LocalUser -Name $Username -Password $SecPass -FullName $Username `
+                      -Description 'Created by setup.ps1' -PasswordNeverExpires:$true -ErrorAction Stop | Out-Null
+        Write-Log 'OK' "User created: $Username"
+    }
+
+    # 'Users' group by SID (S-1-5-32-545) - independent of locale (pt-BR 'Usuarios' vs en 'Users')
+    try {
+        $usersGroup = (Get-LocalGroup -SID 'S-1-5-32-545' -ErrorAction Stop).Name
+        $isMember = @(Get-LocalGroupMember -Group $usersGroup -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -like "*\$Username" -or $_.Name -eq $Username }).Count -gt 0
+        if ($isMember) {
+            Write-Log 'OK' "User $Username already in the $usersGroup group"
+        } else {
+            Add-LocalGroupMember -Group $usersGroup -Member $Username -ErrorAction Stop
+            Write-Log 'OK' "User $Username added to the $usersGroup group"
+        }
+    } catch {
+        Write-Log 'ERROR' "Add to the users group: $($_.Exception.Message)"
+    }
+} catch {
+    Write-Log 'ERROR' "Create user: $($_.Exception.Message)"
+}
+
+# Network
+try {
+    # Only a physical WIRED (802.3) adapter (audit A6): -Physical excludes virtual NICs (Hyper-V,
+    # VPN) and the MediaType filter excludes WiFi, so a static IP can never land on the wrong
+    # adapter when Ethernet is unplugged but WiFi happens to be Up.
+    $adapter = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+               Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' } |
+               Select-Object -First 1
+    if ($adapter) {
+        if ($UseStatic -and $StaticIp) {
+            # DnsServers is intentionally NOT required here: an empty @() is a valid "no DNS" (or
+            # DHCP-provided) config, but `-not @()` is $true, which would misread it as undefined and
+            # abort the whole static branch (leaving the box with no IP at all). Only the prefix and
+            # gateway are mandatory; DNS is applied conditionally below.
+            $missNet = @('StaticPrefixLength', 'StaticGateway') |
+                       Where-Object { -not (Get-Variable $_ -ValueOnly -ErrorAction SilentlyContinue) }
+            if ($missNet) { throw "config.ps1 does not define for static IP: $($missNet -join ', ')" }
+            # Drop any IP already on the adapter (previous run / manual config) so New-NetIPAddress
+            # does not fail with "object already exists".
+            Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+                Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+            # Rollback on failure (audit A7): the IPs/routes were just removed, so if New-NetIPAddress
+            # fails (e.g. a duplicate IP on the network) the adapter would be left with NO address.
+            # Revert to DHCP instead of stranding it, and skip the static DNS below.
+            $staticOk = $true
+            try {
+                New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress $StaticIp `
+                                 -PrefixLength $StaticPrefixLength -DefaultGateway $StaticGateway -ErrorAction Stop | Out-Null
+            } catch {
+                $staticOk = $false
+                Write-Log 'ERROR' "Static IP $StaticIp could not be applied ($($_.Exception.Message)) - reverting the adapter to DHCP so it is not left without an address."
+                Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -Dhcp Enabled -ErrorAction SilentlyContinue | Out-Null
+                Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+            }
+            if ($staticOk) {
+                if (@($DnsServers).Count) {
+                    Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex `
+                                               -ServerAddresses $DnsServers -ErrorAction Stop | Out-Null
+                } else {
+                    Write-Log 'WARN' 'Static IP set but config.ps1 defines no DNS servers ($DnsServers empty).'
+                }
+                Write-Log 'OK' "Static IP: $StaticIp /$StaticPrefixLength GW $StaticGateway"
+            }
+        } else {
+            Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.PrefixOrigin -ne 'WellKnown' } |
+                Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Confirm:$false -ErrorAction SilentlyContinue
+            Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -Dhcp Enabled -ErrorAction SilentlyContinue | Out-Null
+            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses -ErrorAction SilentlyContinue
+            Write-Log 'OK' "DHCP configured"
+        }
+    } else {
+        # No adapter in the 'Up' state (cable unplugged / NIC not ready at imaging time). Do NOT
+        # skip silently: a static-IP box would otherwise ship with no network and no breadcrumb.
+        if ($UseStatic) {
+            Write-Log 'ERROR' 'No wired (802.3) network adapter is Up - static IP was NOT applied (check the cable/NIC).'
+        } else {
+            Write-Log 'WARN' 'No wired (802.3) network adapter is Up - DHCP left at default; verify connectivity later.'
+        }
+    }
+} catch {
+    Write-Log 'ERROR' "Network: $($_.Exception.Message)"
+}
+
+# Wallpaper: COPY the image into %WINDIR% so Phase B (per-user, post-reboot) can apply it from a
+# machine-wide path. Applying it live HERE is pointless - this runs as the bootstrap admin, not the
+# new user - so the HKCU apply + SystemParametersInfo refresh moved to phase-b.ps1. The file is
+# chosen by the selected email domain (Resolve-WallpaperFile): $WallpaperByDomain overrides, else
+# the $WallpaperFile default. Staged under its own basename and recorded in state.WallpaperPath so
+# Phase B applies exactly this file (the default basename 'wallpaper.jpg' also matches Phase B's
+# fallback path). Skipped cleanly if neither is configured (avoids Join-Path $null under StrictMode).
+$WallpaperName = Resolve-WallpaperFile -Domain $EmailDomain -Map $WallpaperByDomain -Default $WallpaperFile
+$WallpaperSrc  = if ($WallpaperName) { Join-Path $ScriptDir $WallpaperName } else { $null }
+if ($WallpaperSrc -and (Test-Path $WallpaperSrc)) {
+    try {
+        $WallpaperDest = "$env:WINDIR\Web\Wallpaper\Corp"
+        $WallpaperLeaf = Split-Path -Leaf $WallpaperName
+        New-Item -ItemType Directory -Path $WallpaperDest -Force | Out-Null
+        Copy-Item $WallpaperSrc "$WallpaperDest\$WallpaperLeaf" -Force
+        $script:WallpaperStaged = "$WallpaperDest\$WallpaperLeaf"
+        Write-Log 'OK' "Wallpaper staged ($EmailDomain): $script:WallpaperStaged"
+    } catch {
+        Write-Log 'ERROR' "Wallpaper: $($_.Exception.Message)"
+    }
+}
+
+# ============================================================
+# PHASE 5 - Install programs (the rest of the pool, in parallel)
+# ============================================================
+# Ninite was already launched in the pre-GUI step (downloading during form entry). Here go the
+# rest via Start-BgInstall (no -Wait): Office (Click-to-Run, separate engine) and Belarc. The join
+# is in PHASE 7; the signature (PHASE 6) runs overlapped. WebAgent (MSI) only in PHASE 7, after the
+# pool (mutex _MSIExecute / error 1618). The printer driver is registered silently (pnputil) in the
+# PHASE 5 prep above; the queue is added in PHASE 7.
+Set-Phase 'Phase 5 - installing programs (parallel)'
+
+# Office (pool) - Click-to-Run is a separate engine from msiexec, runs in parallel
+try {
+    $officeOdt   = Join-Path $PathOffice 'setup.exe'
+    $officeLocal = Join-Path $ScriptDir 'OfficeSetup.exe'
+    if (Test-Path $officeOdt) {
+        # ODT setup.exe needs an action verb; with no args it is a SILENT no-op (installs nothing,
+        # exits 0 -> would log as OK and fool us). configuration.xml is mandatory: it tells ODT what
+        # to install. Working dir = the Office folder so /configure finds the pre-downloaded
+        # \Office\Data next to setup.exe (no SourcePath in the XML -> portable across drive letters).
+        $confXml = Join-Path $PathOffice 'configuration.xml'
+        if (Test-Path $confXml) {
+            Start-BgInstall 'Office ODT' $officeOdt @('/configure', $confXml) -WorkingDirectory $PathOffice -Online | Out-Null
+        } else {
+            Write-Log 'ERROR' "Office ODT setup.exe found but configuration.xml missing in $PathOffice (copy configuration.example.xml) - skipped"
+        }
+    } elseif (Test-Path $officeLocal) {
+        Start-BgInstall 'Office Click-to-Run' $officeLocal -Online | Out-Null
+    } else {
+        Write-Log 'WARN' "Office installer not found (ODT: $officeOdt | USB: $officeLocal)"
+    }
+} catch { Write-Log 'ERROR' "Office: $($_.Exception.Message)" }
+
+# Belarc (pool) - EXE /S
+try {
+    # Match by name (belarc*.exe), NOT the first *.exe: the USB root also holds the Windows
+    # installer's setup.exe, and a broad *.exe filter would launch the Win11 setup (modal,
+    # freezes Phase A) instead of Belarc. See config: $PathBelarc = USB root.
+    $belarc = Get-ChildItem -Path $PathBelarc -Filter 'belarc*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($belarc) { Start-BgInstall 'Belarc' $belarc.FullName @('/S') | Out-Null }
+    else { Write-Log 'WARN' "Belarc installer not found in $PathBelarc" }
+} catch { Write-Log 'ERROR' "Belarc: $($_.Exception.Message)" }
+
+# Epson driver (silent, via pnputil) + TCP/IP port. The extracted INF is registered into the
+# DriverStore with pnputil - the vendor .exe ignores /S and pops its GUI, pnputil does not. Then
+# Add-PrinterDriver makes each parsed model a usable printer driver. Synchronous, so the driver is
+# ready by PHASE 7. The RAW 9100 port does not depend on the driver, so it is created here too.
+$script:PrinterPort = $null
+$script:PrinterInstalled = $false
+if ($SelectedPrinter) {
+    try {
+        $inf = Resolve-EpsonInf $PathEpson
+        if ($inf) {
+            Invoke-InstallerWithTimeout -FilePath (Join-Path $env:WINDIR 'System32\pnputil.exe') `
+                -ArgumentList @('/add-driver', $inf, '/install') -TimeoutSec 300 | Out-Null
+            foreach ($m in @(Get-InfPrinterModels -InfPath $inf)) {
+                if (-not (Get-PrinterDriver -Name $m -ErrorAction SilentlyContinue)) {
+                    Add-PrinterDriver -Name $m -ErrorAction SilentlyContinue
+                }
+                Write-Log 'OK' "Epson driver registered: $m"
+            }
+        } else { Write-Log 'WARN' "No .inf found under $PathEpson - Epson driver not installed" }
+        $script:PrinterPort = "IP_$($SelectedPrinter.ip)"
+        Add-PrinterPort -Name $script:PrinterPort -PrinterHostAddress $SelectedPrinter.ip -ErrorAction SilentlyContinue
+    } catch { Write-Log 'ERROR' "Printer (prep): $($_.Exception.Message)" }
+}
+
+# WebAgent runs in PHASE 7 - it is msiexec, waits for the pool (Ninite) so they don't collide on the mutex.
+
+# (PHASE 6 - Outlook signature - moved to Phase B (phase-b.ps1). It must land in the NEW user's own
+# %APPDATA%\Microsoft\Signatures after the reboot+AutoLogon, not the bootstrap admin's profile, so it
+# can no longer run here. Phase A only STAGES the template tree under C:\ProgramData\CorpSetup in
+# PHASE 8; phase-b.ps1 reads it and writes the signature as the user.)
+
+# ============================================================
+# PHASE 7 - Join the installers + dependent steps + checklist
+# ============================================================
+Set-Phase 'Phase 7 - finishing installers and dependent steps'
+
+# WiFi retry (one shot): Phase A ran very early, when PnP might still have been installing the
+# wireless driver. Minutes have passed (Phases 4-6), so try once more before the installer join
+# below needs internet. Connect-CorpWifi no-ops (returns $true) if already associated; the
+# shorter adapter wait keeps a WiFi-less desktop from stalling here.
+if ($WifiSSID -and -not $script:WifiConnected) {
+    Write-Log 'INFO' 'WiFi: Phase A attempt did not verify - retrying once before the installer join...'
+    $script:WifiConnected = Connect-CorpWifi -Ssid $WifiSSID -Passphrase ([string]$WifiPass) -AdapterWaitSec 10
+}
+
+# Join: wait for each pool installer to finish and evaluate its exit code. Blocking is fine -
+# the progress window lives on its own thread, so it stays responsive while we wait here. Each
+# wait is CAPPED: a hung installer (e.g. Office Click-to-Run stalled with no internet) must not
+# block the whole provision forever - the old unbounded WaitForExit() would never reboot into
+# Phase B, bricking the machine. On timeout, kill it, log an error, and move on so the box still
+# finishes + hands off (minus that one app). Cap mirrors Invoke-InstallerWithTimeout (1800s).
+$JoinTimeoutSec = 1800
+foreach ($bgItem in $BgInstalls) {
+    try {
+        if (-not $bgItem.Proc) {
+            Write-Log 'ERROR' "$($bgItem.Name): process did not start (skipped join)"
+            continue
+        }
+        if (-not $bgItem.Proc.WaitForExit($JoinTimeoutSec * 1000)) {
+            try { $bgItem.Proc.Kill() } catch { }
+            Write-Log 'ERROR' "$($bgItem.Name): timed out after ${JoinTimeoutSec}s - killed (provisioning continues)"
+            continue
+        }
+        $code = $bgItem.Proc.ExitCode
+        if ($bgItem.OkCodes -contains $code) {
+            Write-Log 'OK' "$($bgItem.Name) exit $code"
+            continue
+        }
+        # Failed. An online installer (Ninite / Office C2R) fails with a WinINet 0x80072Exx code when
+        # the box has no internet - e.g. 0x80072EE7 (-2147012889) = download server name not resolved.
+        # Ninite launches early; the wired/WiFi link may only come up during Phase 4, so retry ONCE if
+        # the network is reachable now. If it is still down, say so plainly instead of a cryptic code.
+        if ($bgItem.Online) {
+            if (Test-InternetUp) {
+                Write-Log 'WARN' "$($bgItem.Name) failed (exit $code); internet is reachable now - retrying once..."
+                $retry = Invoke-InstallerWithTimeout -FilePath $bgItem.FilePath -ArgumentList $bgItem.ArgumentList -WorkingDirectory $bgItem.WorkingDirectory -TimeoutSec $JoinTimeoutSec
+                if ($retry) { Write-ProcResult "$($bgItem.Name) (retry)" $retry $bgItem.OkCodes }
+            } else {
+                Write-Log 'ERROR' "$($bgItem.Name) failed (exit $code) - NO INTERNET: the machine could not reach the download servers. Connect it to the network, then re-run $($bgItem.Name) (or re-run setup)."
+            }
+        } else {
+            Write-Log 'ERROR' "$($bgItem.Name) failed (exit $code)"
+        }
+    } catch { Write-Log 'ERROR' "$($bgItem.Name) (join): $($_.Exception.Message)" }
+}
+
+# Printer: the Epson driver was registered silently in PHASE 5 (pnputil). Poll briefly for it, then
+# create the queue directly under the corp name from printers.json over the RAW 9100 port. No vendor
+# wizard runs, so there is no model-named queue to reconcile. Idempotent: an existing corp-named queue
+# (run.bat re-run) is left as-is.
+if ($SelectedPrinter -and $script:PrinterPort) {
+    try {
+        $driverName = $null
+        for ($d = 0; $d -lt 20 -and -not $driverName; $d++) {
+            $driverObj = Get-PrinterDriver -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match 'Epson' } | Select-Object -First 1
+            if ($driverObj) { $driverName = $driverObj.Name } else { Start-Sleep -Milliseconds 500 }
+        }
+        if (-not $driverName) {
+            Write-Log 'WARN' "Epson driver not registered - add the printer manually"
+        } elseif (Get-Printer -Name $SelectedPrinter.name -ErrorAction SilentlyContinue) {
+            $script:PrinterInstalled = $true
+            Write-Log 'OK' "Printer already present: $($SelectedPrinter.name) [$($SelectedPrinter.ip)]"
+        } else {
+            Add-Printer -Name $SelectedPrinter.name -DriverName $driverName `
+                        -PortName $script:PrinterPort -ErrorAction Stop | Out-Null
+            $script:PrinterInstalled = $true
+            Write-Log 'OK' "Printer: $($SelectedPrinter.name) [$($SelectedPrinter.ip)]"
+        }
+    } catch { Write-Log 'ERROR' "Printer: $($_.Exception.Message)" }
+}
+
+# WebAgent (msiexec) - the pool/Ninite finished now, so the Installer mutex is free.
+# Tries MSI > ZIP (extracts MSI) > legacy EXE.
+if ($InstallWebAgent) {
+    try {
+        $waMsi = Get-ChildItem -Path $PathWebAgent -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $waZip = Get-ChildItem -Path $PathWebAgent -Filter '*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+        $waExe = Get-ChildItem -Path $PathWebAgent -Filter '*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        if ($waMsi) {
+            Write-Log 'INFO' "WebAgent MSI: $($waMsi.Name)"
+            $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($waMsi.FullName)`"", '/quiet', '/norestart')
+            if ($p) { Write-ProcResult 'WebAgent (MSI)' $p @(0, 3010) }
+        } elseif ($waZip) {
+            Write-Log 'INFO' "WebAgent ZIP: $($waZip.Name) - extracting..."
+            $extractDir = "$env:TEMP\webagent_extract"
+            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+            Expand-Archive -Path $waZip.FullName -DestinationPath $extractDir -Force
+            $msiInZip = Get-ChildItem -Path $extractDir -Filter '*.msi' -Recurse | Select-Object -First 1
+            if ($msiInZip) {
+                $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($msiInZip.FullName)`"", '/quiet', '/norestart')
+                if ($p) { Write-ProcResult 'WebAgent (ZIP)' $p @(0, 3010) }
+            } else {
+                Write-Log 'WARN' "No MSI found inside the ZIP"
+            }
+        } elseif ($waExe) {
+            Write-Log 'INFO' "WebAgent EXE (legacy): $($waExe.Name)"
+            $p = Invoke-InstallerWithTimeout $waExe.FullName @('/S')
+            if ($p) { Write-ProcResult 'WebAgent (EXE)' $p }
+        } else {
+            Write-Log 'WARN' "WebAgent installer not found in $PathWebAgent"
+        }
+    } catch { Write-Log 'ERROR' "WebAgent: $($_.Exception.Message)" }
+}
+
+# VPN (OpenVPN) - install the MSI machine-wide (needs admin, so it runs here in Phase A). The
+# per-user profile import happens in Phase B (it must land in the CREATED user's profile, not the
+# setup admin's). Gated by the GUI checkbox / -TestVpn.
+if ($InstallVpn) {
+    try {
+        if ($PathVPN -and (Test-Path $PathVPN)) {
+            $vpnMsi = Get-ChildItem -Path $PathVPN -Filter '*.msi' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($vpnMsi) {
+                Write-Log 'INFO' "OpenVPN MSI: $($vpnMsi.Name)"
+                $p = Invoke-InstallerWithTimeout 'msiexec.exe' @('/i', "`"$($vpnMsi.FullName)`"", '/quiet', '/norestart')
+                if ($p) { Write-ProcResult 'OpenVPN (MSI)' $p @(0, 3010) }
+            } else {
+                Write-Log 'WARN' "OpenVPN installer (.msi) not found in $PathVPN"
+            }
+        } else {
+            Write-Log 'WARN' 'VPN selected but PathVPN is not set/found - skipping OpenVPN install'
+        }
+    } catch { Write-Log 'ERROR' "OpenVPN: $($_.Exception.Message)" }
+}
+
+# Corp bookmarks (Firefox only, here in Phase A). Firefox reads distribution\policies.json with
+# Placement:'toolbar', which drops each link LOOSE on the bookmarks toolbar (not inside a folder) -
+# so this is correct as-is; it needs the install dir + admin, hence machine-wide in Phase A.
+# Chrome/Edge are handled per-user in Phase B (Set-ChromiumBookmarks): their managed-policy path put
+# the links inside a "Managed bookmarks" folder, so we seed the user's profile Bookmarks file instead
+# to get them loose on the bar. Only the per-link boxes that were ticked reach $SelectedBookmarks.
+if (@($SelectedBookmarks).Count -gt 0) {
+    try {
+        $bm = ConvertTo-BrowserBookmarkPolicy -Bookmarks $SelectedBookmarks
+
+        $ffDir = @("$env:ProgramFiles\Mozilla Firefox", "${env:ProgramFiles(x86)}\Mozilla Firefox") |
+                 Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        if ($ffDir) {
+            $ffDist = Join-Path $ffDir 'distribution'
+            New-Item -ItemType Directory -Path $ffDist -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $ffDist 'policies.json') -Value $bm.FirefoxJson -Encoding UTF8
+            Write-Log 'OK' 'Corp bookmarks: Firefox policies.json written'
+        } else {
+            Write-Log 'WARN' 'Corp bookmarks: Firefox not installed - skipped'
+        }
+    } catch { Write-Log 'ERROR' "Corp bookmarks (Firefox): $($_.Exception.Message)" }
+}
+
+# Keep Edge/Chrome from PRE-CREATING the new user's profile at sign-in, before the 30s-delayed Phase B
+# task seeds the bookmark bar. Edge "startup boost" and Edge/Chrome "background mode" launch the
+# browser in the background at logon, which creates Default\Bookmarks - and Phase B's skip-if-exists
+# guard then skips seeding (leaving the bar empty). Disable them fleet-wide via HKLM managed policy
+# (machine scope, needs the Phase A elevation). Only relevant when we actually seed Chrome/Edge links.
+if (@($SelectedBookmarks).Count -gt 0) {
+    try {
+        $browserPolicies = @(
+            @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name = 'StartupBoostEnabled';  Value = 0 }
+            @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'; Name = 'BackgroundModeEnabled'; Value = 0 }
+            @{ Path = 'HKLM:\SOFTWARE\Policies\Google\Chrome';  Name = 'BackgroundModeEnabled'; Value = 0 }
+        )
+        foreach ($p in $browserPolicies) {
+            if (-not (Test-Path -LiteralPath $p.Path)) { New-Item -Path $p.Path -Force | Out-Null }
+            New-ItemProperty -Path $p.Path -Name $p.Name -Value $p.Value -PropertyType DWord -Force | Out-Null
+        }
+        Write-Log 'OK' 'Browser auto-launch disabled (Edge startup boost + Edge/Chrome background mode) so Phase B seeds bookmarks first'
+    } catch { Write-Log 'ERROR' "Disable browser auto-launch: $($_.Exception.Message)" }
+}
+
+# ============================================================
+# Cloud agent - copy the vendor toolkit locally and run its installer
+# ============================================================
+# The vendor's cloud-agent toolkit ships on the USB in its own subfolder ($PathCloudAgent).
+# Copy the whole folder to $CloudAgentInstallDir so the machine keeps a local copy of the vendor
+# exes + the installer for re-runs, then run the vendor's installer bat ($CloudAgentInstaller).
+# The bat registers the machine in the vendor DB (best-effort), drops its exes, creates its
+# logon scheduled task (-AtLogOn, BUILTIN\Users) and adds the Defender exclusions it requires.
+#
+# Run the bat FROM THE USB ($PathCloudAgent), not from the local copy: the bat passes its own
+# folder as the installer's copy SOURCE. From the USB that source is the pendrive, so the install
+# copies cleanly; from the local copy it would copy the exes onto themselves (noisy errors).
+#
+# Hands-free: every branch of the installer ends with a Read-Host prompt, which on a real
+# console BLOCKS Phase A forever (no human to press Enter). Redirect stdin from an empty file so
+# each Read-Host hits EOF and returns at once; the hidden window then closes on its own.
+# (Start-Process -RedirectStandardInput rejects "NUL" - it resolves it as a relative file path.)
+#
+# SECURITY (declared, vendor-required + pre-authorized): the installer adds Defender exclusions
+# for its install dir + its processes. Logged below as a conscious action.
+if ($PathCloudAgent) {
+    Set-Phase 'Phase 7 - Cloud agent install'
+    if (-not $CloudAgentInstaller)  { $CloudAgentInstaller  = 'install.bat' }
+    if (-not $CloudAgentInstallDir) { $CloudAgentInstallDir = 'C:\CloudAgent' }
+    $agentBat = Join-Path $PathCloudAgent $CloudAgentInstaller
+    if (Test-Path $agentBat) {
+        try {
+            New-Item -ItemType Directory -Path $CloudAgentInstallDir -Force | Out-Null
+            # Best-effort local retention only: the install itself runs from the USB
+            # ($PathCloudAgent) and the vendor re-copies its exes, so this copy is NOT a
+            # prerequisite. A locked/in-use file on a re-run (the vendor exe is launched at logon
+            # by the task the installer registers) must not abort the step -> own try/catch -> WARN.
+            try {
+                # Guard: if $PathCloudAgent is mis-set to the USB ROOT (toolkit dropped loose at
+                # the root, or the wizard's Advanced path got an empty suffix), the wildcard would
+                # slurp the ENTIRE USB (Windows sources, every installer) into the install dir.
+                # Copy only when it resolves to a real subfolder, never the root itself.
+                $agentSrc = (Resolve-Path -LiteralPath $PathCloudAgent).Path.TrimEnd('\')
+                $usbRoot  = (Resolve-Path -LiteralPath $ScriptDir).Path.TrimEnd('\')
+                if ($agentSrc -eq $usbRoot) {
+                    Write-Log 'WARN' 'Cloud agent: PathCloudAgent points at the USB root - skipping the local copy (it would copy the whole USB). Put the toolkit in its own subfolder.'
+                } else {
+                    Copy-Item -Path (Join-Path $PathCloudAgent '*') -Destination $CloudAgentInstallDir -Recurse -Force
+                    Write-Log 'OK' "Cloud agent toolkit copied to $CloudAgentInstallDir"
+                }
+            } catch {
+                Write-Log 'WARN' "Cloud agent: local retention copy skipped (likely an in-use file on re-run): $($_.Exception.Message)"
+            }
+            Write-Log 'INFO' 'Cloud agent: installer adds Defender exclusions for its install dir + processes (vendor-required, declared)'
+
+            # Empty stdin -> the installer's Read-Host calls return at once (never block Phase A).
+            $agentStdin = Join-Path $env:TEMP 'cloudagent_stdin.txt'
+            Set-Content -LiteralPath $agentStdin -Value $null
+            $agentOut = Join-Path $env:TEMP 'cloudagent_out.txt'
+            $agentErr = Join-Path $env:TEMP 'cloudagent_err.txt'
+
+            $proc = Start-Process cmd.exe -PassThru -WindowStyle Hidden `
+                -ArgumentList @('/c', "`"$agentBat`"") `
+                -RedirectStandardInput  $agentStdin `
+                -RedirectStandardOutput $agentOut `
+                -RedirectStandardError  $agentErr
+            # Cache the handle BEFORE exit, else .ExitCode reads blank when stdio is redirected.
+            $null = $proc.Handle
+            $agentExited = $proc.WaitForExit(300 * 1000)
+            if (-not $agentExited) {
+                # Tree-kill: $proc is cmd.exe, which spawned the bat -> powershell grandchild doing
+                # the actual install. Bare Kill() on PS 5.1 only kills cmd.exe and orphans the
+                # grandchild (it keeps mutating the machine + holds the stdout/stderr handles open).
+                # taskkill /T terminates the whole tree; WaitForExit() then lets the handles release
+                # before we read/delete the capture files.
+                try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+                try { $proc.WaitForExit() } catch { }
+            }
+            # Fold the installer's own progress into our log - on BOTH the normal and the timeout
+            # path, so a hung install still leaves diagnostics behind.
+            foreach ($f in @($agentOut, $agentErr)) {
+                if (Test-Path $f) {
+                    Get-Content -LiteralPath $f -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -and $_.Trim() } |
+                        ForEach-Object { Write-Log 'INFO' "CloudAgent| $($_.Trim())" }
+                }
+            }
+            if (-not $agentExited) {
+                Write-Log 'ERROR' 'Cloud agent installer timed out after 300s - tree killed'
+            } elseif ($proc.ExitCode -eq 0) {
+                Write-Log 'OK' "Cloud agent installed ($CloudAgentInstallDir + vendor logon task + Defender). DB registration is best-effort (off-network = skipped)."
+            } else {
+                Write-Log 'WARN' "Cloud agent installer exit $($proc.ExitCode) - review the CloudAgent| lines above"
+            }
+            Remove-Item -LiteralPath $agentStdin, $agentOut, $agentErr -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log 'ERROR' "Cloud agent install: $($_.Exception.Message)"
+        }
+    } else {
+        Write-Log 'WARN' "Cloud agent installer not found at $agentBat - skipping the cloud-agent step"
+    }
+} else {
+    Write-Log 'INFO' 'Cloud agent step skipped (PathCloudAgent not set in config.ps1)'
+}
+
+$checklist = @"
+
+========================================
+  POST-SETUP MANUAL CHECKLIST
+========================================
+User     : $Username ($FullName)
+Email    : $Email
+Date     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+PC name  : $env:COMPUTERNAME
+
+PENDING:
+[ ] REBOOT to apply the new PC name
+[ ] Confirm Windows activation (slmgr /xpr) - OEM activation is best-effort
+[ ] Register the machine on the intranet
+[ ] Office 365 login: $Email
+[ ] Verify the Outlook signature (Phase B applies it on the user's first logon)
+[ ] Test the printer: $(if ($SelectedPrinter) { if ($script:PrinterInstalled) { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)]" } else { "$($SelectedPrinter.name) [$($SelectedPrinter.ip)] - INSTALL FAILED, add it manually" } } else { 'None' })
+[ ] ERP client (if requested in the ticket)
+[ ] Cloud agent: confirm the local copy + the vendor logon task (DB registration happens only on the corporate network)
+[ ] Hand over credentials: login=$Username / password=(see config.ps1 - do not record in the log)
+========================================
+Log: $LogFile
+"@
+
+Add-Content -Path $LogFile -Value $checklist -Encoding UTF8 -ErrorAction SilentlyContinue
+
+# Show the checklist in the progress window (enqueue each line; the file already has it once).
+if ($script:LogQueue) {
+    foreach ($cl in ($checklist -split "`n")) {
+        $script:LogQueue.Enqueue([pscustomobject]@{ Level = 'INFO'; Line = $cl })
+    }
+}
+
+# ============================================================
+# PHASE 8 - Phase B handoff: STAGING (PREP) - only under -EnableHandoff
+# ============================================================
+# Stage everything Phase B + cleanup need into C:\ProgramData\CorpSetup and register the two
+# -AtLogOn tasks. This does NOT arm AutoLogon or reboot - that is the COMMIT block at the very end,
+# after the technician has reviewed the log and closed the progress window. Runs here (before the
+# exit-code tally) so its log lines stream into the window and any failure counts toward $exitCode.
+# The folder keeps the INHERITED ProgramData ACL on purpose: the standard user must READ
+# state.json/Signatures and WRITE its logs + user-done here, and that default ACL already stops the
+# user from overwriting the admin-owned cleanup.ps1 (which SYSTEM runs) - the only thing worth
+# guarding. state.json never holds a credential.
+if ($EnableHandoff) {
+    Set-Phase 'Phase 8 - Phase B handoff (staging + tasks)'
+    $StateDir = Join-Path $env:ProgramData 'CorpSetup'
+    try {
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+
+        # state.json - NO credential (the AutoLogon password goes to HKLM in COMMIT, never to disk here).
+        $printerName = if ($SelectedPrinter) { $SelectedPrinter.name } else { '' }
+        $state = New-CorpStateObject -Username $Username -FullName $FullName -Email $Email `
+                    -EmailDomain $EmailDomain -SectorName $SectorName -SigTemplate $SigTemplate `
+                    -PrinterName $printerName -WallpaperPath $script:WallpaperStaged `
+                    -Bookmarks $SelectedBookmarks `
+                    -DesktopShortcutNames @($DesktopShortcutBookmarks | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        # -Depth 5: Bookmarks is an array of @{Name;Url}; the default depth 2 would stringify them.
+        # Atomic write (audit A8): serialize to a temp file, then Move-Item over the final name, so a
+        # power loss can only leave the previous state.json or none - never a truncated file that
+        # would pass the $ready gate below and reboot into a doomed Phase B handoff.
+        $stateFile = Join-Path $StateDir 'state.json'
+        $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$stateFile.tmp" -Encoding UTF8 -Force
+        Move-Item -LiteralPath "$stateFile.tmp" -Destination $stateFile -Force
+        Write-Log 'OK' 'state.json written (no credentials)'
+
+        # Stage the Phase B + cleanup scripts off the USB (it may be pulled before the user logs on).
+        foreach ($s in 'phase-b.ps1', 'cleanup.ps1') {
+            $src = Join-Path $ScriptDir $s
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $StateDir $s) -Force
+                Write-Log 'OK' "Staged: $s"
+            } else {
+                Write-Log 'ERROR' "Handoff: $s not found at $ScriptDir - cannot stage (Phase B will not run)"
+            }
+        }
+
+        # Stage the selected sector's signature subtree (recursive: *.htm + the <template>_files logo
+        # folders). phase-b resolves Signatures\<domain>\<sector>\..., so preserve that two-level depth.
+        # Skip when there is no real sector (mirrors phase-b's own '(...)'/empty skip). Isolated in its
+        # OWN try/catch: the signature is the SOFT part (phase-b WARN-skips a missing template), so a
+        # copy failure (locked asset, MAX_PATH on 5.1) must NOT abort the essential task registration
+        # below and brick the whole machine->user handoff.
+        if ($SectorName -and $SectorName -notmatch '^\(') {
+            try {
+                $sigSrc = Join-Path (Join-Path $PathSignatures $EmailDomain) $SectorName
+                if (Test-Path -LiteralPath $sigSrc) {
+                    # Copy the sector's CONTENTS into the dest sector folder (not the folder itself), so
+                    # a re-run (run.bat) overwrites in place instead of nesting <sector>\<sector>.
+                    $sigDest = Join-Path $StateDir (Join-Path 'Signatures' (Join-Path $EmailDomain $SectorName))
+                    New-Item -ItemType Directory -Path $sigDest -Force | Out-Null
+                    Copy-Item -Path (Join-Path $sigSrc '*') -Destination $sigDest -Recurse -Force
+                    Write-Log 'OK' "Signature sector staged: $EmailDomain\$SectorName"
+                } else {
+                    Write-Log 'WARN' "Signature source not found (Phase B will skip signature): $sigSrc"
+                }
+            } catch {
+                Write-Log 'ERROR' "Signature staging (non-fatal, Phase B will skip): $($_.Exception.Message)"
+            }
+        }
+
+        # Stage the VPN profile (.ovpn) for Phase B, only if the tech selected VPN. Phase B (running
+        # AS the new user) imports it into %USERPROFILE%\OpenVPN\config. Own try/catch: like the
+        # signature, a copy failure must not abort the task registration below and brick the handoff.
+        if ($InstallVpn -and $PathVPN -and (Test-Path $PathVPN)) {
+            try {
+                $ovpnSrc = Get-ChildItem -Path $PathVPN -Filter '*.ovpn' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($ovpnSrc) {
+                    $vpnDest = Join-Path $StateDir 'VPN'
+                    New-Item -ItemType Directory -Path $vpnDest -Force | Out-Null
+                    Copy-Item -LiteralPath $ovpnSrc.FullName -Destination (Join-Path $vpnDest $ovpnSrc.Name) -Force
+                    Write-Log 'OK' "VPN profile staged: $($ovpnSrc.Name)"
+                } else {
+                    Write-Log 'WARN' "VPN selected but no .ovpn found in $PathVPN (Phase B will skip)"
+                }
+            } catch {
+                Write-Log 'ERROR' "VPN staging (non-fatal, Phase B will skip): $($_.Exception.Message)"
+            }
+        }
+
+        # Register the two -AtLogOn tasks (idempotent via -Force). Names are the exact contract
+        # cleanup.ps1 hardcodes. The user task runs as the new user (resolved by SID - immune to the
+        # pending PC rename) in its interactive session; the SYSTEM task runs cleanup at highest priv.
+        $userSid = (Get-LocalUser -Name $Username -ErrorAction Stop).SID.Value
+        $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+        $uAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $StateDir 'phase-b.ps1'))
+        $uTrig   = New-ScheduledTaskTrigger -AtLogOn -User $Username
+        $uTrig.Delay = 'PT30S'   # let the profile / print spooler settle before SetDefaultPrinter
+        $uPrin   = New-ScheduledTaskPrincipal -UserId $userSid -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName 'CorpSetup-PhaseB-User' -Action $uAction -Trigger $uTrig `
+            -Principal $uPrin -Settings $set -Force | Out-Null
+        Write-Log 'OK' 'Task registered: CorpSetup-PhaseB-User'
+
+        $sAction = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f (Join-Path $StateDir 'cleanup.ps1'))
+        $sTrig   = New-ScheduledTaskTrigger -AtLogOn -User $Username
+        $sPrin   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName 'CorpSetup-PhaseB-System' -Action $sAction -Trigger $sTrig `
+            -Principal $sPrin -Settings $set -Force | Out-Null
+        Write-Log 'OK' 'Task registered: CorpSetup-PhaseB-System'
+
+        Write-Log 'INFO' 'Phase B staged. Closing this window will REBOOT the PC to run Phase B.'
+    } catch {
+        Write-Log 'ERROR' "Handoff staging: $($_.Exception.Message)"
+    }
+}
+
+if ($script:Errors.Count -gt 0) {
+    $s = if ($script:Errors.Count -ne 1) { 's' } else { '' }
+    Write-Log 'INFO' "Setup completed with $($script:Errors.Count) error$s"
+    if ($script:UiState) { $script:UiState.Status = "Done - $($script:Errors.Count) error$s. Review the red lines above, then close." }
+    $exitCode = 1
+} else {
+    Write-Log 'OK' "setup.ps1 completed without errors"
+    if ($script:UiState) { $script:UiState.Status = 'Done - no errors. You may close this window.' }
+    $exitCode = 0
+}
+
+# Hand the progress window to the technician: mark Done (the Timer enables Close and fills the
+# bar), then block until they close it (Application.Run returns) so we don't kill the window on
+# exit. If the window was closed early, EndInvoke returns at once and the work still completed.
+if ($script:ProgUI) {
+    $script:UiState.Done = $true
+    try { $script:ProgUI.PS.EndInvoke($script:ProgUI.Handle) } catch { }
+    try { $script:ProgUI.PS.Dispose() } catch { }
+    try { $script:ProgUI.Runspace.Dispose() } catch { }
+}
+
+# ============================================================
+# PHASE 8 - Phase B handoff: COMMIT (arm AutoLogon + reboot) - only under -EnableHandoff
+# ============================================================
+# Runs AFTER the progress window closed (interactive: technician reviewed the log and clicked Close;
+# headless production: no window, falls straight through). Arm the one-shot AutoLogon and reboot into
+# Phase B. Guarded by HARD preconditions so a half-provisioned box is never armed/rebooted - but NOT
+# by $script:Errors: a failed install must not block Phase B (signature/wallpaper/default-printer are
+# independent of it).
+if ($EnableHandoff) {
+    $StateDir = Join-Path $env:ProgramData 'CorpSetup'
+    $ready =
+        [bool](Get-LocalUser -Name $Username -ErrorAction SilentlyContinue) -and
+        (Test-StateJson -Path (Join-Path $StateDir 'state.json')) -and
+        (Test-Path -LiteralPath (Join-Path $StateDir 'phase-b.ps1')) -and
+        (Test-Path -LiteralPath (Join-Path $StateDir 'cleanup.ps1')) -and
+        [bool](Get-ScheduledTask -TaskName 'CorpSetup-PhaseB-User'   -ErrorAction SilentlyContinue) -and
+        [bool](Get-ScheduledTask -TaskName 'CorpSetup-PhaseB-System' -ErrorAction SilentlyContinue)
+    if ($ready) {
+        try {
+            # 🔓 Declared brecha (accepted in the plan): Winlogon AutoLogon stores the password in
+            # PLAINTEXT in HKLM - there is no DPAPI option. One boot only: AutoLogonCount=1 makes
+            # Windows consume + clear it even if cleanup never runs, and cleanup.ps1 (SYSTEM) zeroes
+            # AND verifies it at the end of Phase B. DefaultDomainName='.' = the local machine,
+            # name-independent (the BIOS-serial rename only takes effect on the reboot below).
+            $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            # Order matters (audit A10): write the credentials + one-shot counter FIRST, then flip
+            # AutoAdminLogon on LAST, so a crash mid-sequence never leaves autologon enabled without a
+            # password (which would strand the machine at a stuck logon prompt).
+            Set-ItemProperty -Path $winlogon -Name 'DefaultUserName'   -Value $Username
+            Set-ItemProperty -Path $winlogon -Name 'DefaultDomainName' -Value '.'
+            Set-ItemProperty -Path $winlogon -Name 'DefaultPassword'   -Value $UserInitialPass
+            Set-ItemProperty -Path $winlogon -Name 'AutoLogonCount'    -Value 1 -Type DWord
+            Set-ItemProperty -Path $winlogon -Name 'AutoAdminLogon'    -Value '1'
+            Write-Log 'OK' 'AutoLogon armed for Phase B (one-shot).'
+            if (-not $NoReboot) {
+                Set-PhaseAState 'phase-a-complete; rebooting into Phase B'
+                Write-Log 'INFO' 'Rebooting into Phase B...'
+                Restart-Computer -Force
+            }
+        } catch {
+            Write-Log 'ERROR' "Arm AutoLogon / reboot: $($_.Exception.Message)"
+            $exitCode = 1
+        }
+    } else {
+        Write-Log 'ERROR' 'Handoff preconditions not met - NOT arming AutoLogon / NOT rebooting. Finish Phase B manually.'
+        $exitCode = 1
+    }
+}
+
+# Record the final Phase A state for power-loss diagnosis (audit C1), then signal success/failure
+# to the caller (run.bat / FirstLogonCommands check %errorlevel%).
+Set-PhaseAState "phase-a-finished; exitCode=$exitCode"
+exit $exitCode

@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+
+  <!-- ============================================================ -->
+  <!-- windowsPE: Locale + bypass TPM/SecureBoot + partitioning     -->
+  <!-- ============================================================ -->
+  <settings pass="windowsPE">
+
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>pt-BR</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+    <!-- The TPM/SecureBoot/RAM bypass previously lived here in a Microsoft-Windows-Deployment
+         component, but that component's RunSynchronous is NOT honored in the windowsPE pass, so the
+         checks were never actually bypassed on no-TPM hardware. It now lives in the
+         Microsoft-Windows-Setup RunSynchronous below - the only RunSynchronous valid in windowsPE
+         (audit A14). -->
+
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <!-- Generic Win 11 Pro key — selects the Pro edition, does not activate -->
+      <!-- Activation via the OEM key in the UEFI firmware (automatic on Dell) -->
+      <UserData>
+        <ProductKey>
+          <Key>VK7JG-NPHTM-C97JM-9MPGT-3V66T</Key>
+          <WillShowUI>OnError</WillShowUI>
+        </ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+
+      <!-- DISK GUARD (FAIL-CLOSED): runs BEFORE DiskConfiguration (the wipe). The USB drive letter
+           is not fixed in WinPE, so Order 1 scans the drives and calls guard-disk.cmd, which shuts
+           the machine down UNLESS it confirms EXACTLY 1 fixed disk - and on success writes the
+           marker %TEMP%\guard_ok.flag. Order 2 shuts down if that marker is absent, so even if
+           guard-disk.cmd is missing from the media (never called) the install fails CLOSED instead
+           of wiping blind. Setup\RunSynchronous is the only valid RunSynchronous in windowsPE.
+           ====================================================================
+           WARNING: the RunSynchronous-vs-wipe ordering is NOT pinned down by Microsoft
+           (medium confidence). TEST in a VM with 2 disks BEFORE relying on it in production.
+           To disable the guard, delete both RunSynchronousCommand blocks below. -->
+      <RunSynchronous>
+        <!-- Bypass TPM/SecureBoot/RAM for PCs without TPM 2.0 (older Dells). Only these 3 LabConfig
+             keys actually exist; BypassCPUCheck/BypassStorageCheck are no-ops. They run first so the
+             hardware checks are relaxed before anything else in windowsPE (audit A14). -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass TPM check (LabConfig)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass SecureBoot check (LabConfig)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>cmd /c reg add "HKLM\SYSTEM\Setup\LabConfig" /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+          <Description>Bypass RAM check (LabConfig)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>cmd /c "for %i in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist %i:\guard-disk.cmd call %i:\guard-disk.cmd"</Path>
+          <Description>Guard: run guard-disk.cmd (aborts unless exactly 1 fixed disk)</Description>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>cmd /c "if not exist %TEMP%\guard_ok.flag wpeutil shutdown"</Path>
+          <Description>Guard: fail closed if guard-disk.cmd did not confirm a single disk</Description>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+
+      <!-- GPT/UEFI: EFI (300MB) + MSR (16MB) + Windows (remainder) -->
+      <!-- WillShowUI=OnError: pauses and shows UI if partitioning FAILS.
+           It does NOT protect against wiping the wrong disk in a multi-disk scenario
+           (wiping the wrong Disk 0 raises no "error"). Assumption: the target machine has
+           a single disk. The ">1 disk" guard is the RunSynchronous above (guard-disk.cmd). -->
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Size>300</Size>
+              <Type>EFI</Type>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Size>16</Size>
+              <Type>MSR</Type>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Extend>true</Extend>
+              <Type>Primary</Type>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>FAT32</Format>
+              <Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+      </ImageInstall>
+
+    </component>
+  </settings>
+
+  <!-- ============================================================ -->
+  <!-- specialize: Locale + random name + BypassNRO                 -->
+  <!-- ============================================================ -->
+  <settings pass="specialize">
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+    </component>
+
+    <!-- Avoids the "connect to a network" OOBE screen. Valid up to ~24H2 (build 26100);
+         MS removed BypassNRO in later Insider builds (26200+). It is redundant here:
+         oobeSystem already skips the entire OOBE (SkipMachine/UserOOBE +
+         HideOnlineAccountScreens), so the network screen is never reached. -->
+    <component name="Microsoft-Windows-Deployment"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v BypassNRO /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+
+  </settings>
+
+  <!-- ============================================================ -->
+  <!-- oobeSystem: Skip OOBE, create __ADMIN_USER__ account, autologon     -->
+  <!-- ============================================================ -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>__ADMIN_USER__</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <!-- The <Value> below is filled in by build-usb.ps1 when building the USB
+                   (base64 of UTF-16 of PASSWORD + "Password" suffix, as Windows expects). -->
+              <Value>__ADMIN_PW_B64__</Value>
+              <PlainText>false</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>__ADMIN_USER__</Username>
+        <Password>
+          <Value>__ADMIN_PW_B64__</Value>
+          <PlainText>false</PlainText>
+        </Password>
+        <!-- LogonCount=1: the bootstrap admin autologons exactly ONCE, to run setup.ps1 (Phase A).
+             With -EnableHandoff (production), Phase A finishes by re-arming a SEPARATE one-shot
+             AutoLogon in HKLM\...\Winlogon for the new standard user and rebooting into Phase B, so
+             after that reboot the NEW USER logs on, never the bootstrap admin again. Do NOT raise
+             this number: a second bootstrap autologon would fight the new-user handoff. -->
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <!-- Launches setup.ps1 from the USB on first logon (real hands-free).
+           The USB drive letter is not deterministic, so it scans the drives looking for
+           the one that has setup.ps1 AND config.ps1 together (the real payload — avoids
+           picking up a stray setup.ps1 on another drive). On first logon the USB may not
+           have a letter yet, so it retries for ~60s (30x2s). If not found, it warns with a
+           MessageBox (instead of failing silently) and exits 2. Runs in GUI mode (NO
+           -Unattended). Passes -EnableHandoff, so setup.ps1 runs the full 2-phase handoff:
+           it stages Phase B + arms the new-user AutoLogon, and on closing the progress window
+           reboots into Phase B. It captures setup.ps1's exit code (-PassThru) and propagates it
+           (exit $p.ExitCode) so a failed provisioning surfaces to Windows Setup instead of
+           reporting success. Exit contract: 0 = success, 1 = errors tracked, 2 = fatal
+           (guard / config / USB-not-found). -->
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$d=$null; for($i=0;$i -lt 30 -and -not $d;$i++){ $d=Get-PSDrive -PSProvider FileSystem | Where-Object { (Test-Path (Join-Path $_.Root 'setup.ps1')) -and (Test-Path (Join-Path $_.Root 'config.ps1')) } | Select-Object -First 1; if(-not $d){ Start-Sleep -Seconds 2 } }; if($d){ $p=Start-Process powershell.exe -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $d.Root 'setup.ps1'),'-EnableHandoff' -Wait -PassThru; exit $p.ExitCode } else { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('Setup USB not found (needs setup.ps1 + config.ps1 at the root). Reconnect the USB and run run.bat manually.','Setup','OK','Error') | Out-Null; exit 2 }"</CommandLine>
+          <Description>Post-provisioning: opens setup.ps1 (GUI) from the USB</Description>
+          <RequiresUserInput>true</RequiresUserInput>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+
+      <TimeZone>E. South America Standard Time</TimeZone>
+
+    </component>
+
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+      <InputLocale>0416:00010416</InputLocale>
+      <SystemLocale>pt-BR</SystemLocale>
+      <UILanguage>pt-BR</UILanguage>
+      <UserLocale>pt-BR</UserLocale>
+    </component>
+
+  </settings>
+
+</unattend>

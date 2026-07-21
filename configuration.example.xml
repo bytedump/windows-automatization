@@ -1,0 +1,58 @@
+<!--
+  configuration.example.xml - Office Deployment Tool (ODT) template
+  COPY to the USB at:  <USB>\Office\configuration.xml
+
+  Product: Microsoft 365 Apps (subscription) - activates by user sign-in (no key).
+           E3/E5 -> O365ProPlusRetail   |   Business Std/Premium -> O365BusinessRetail
+
+  OFFLINE workflow (recommended for USB provisioning):
+    1. Put the ODT setup.exe in  <USB>\Office\setup.exe
+    2. Copy this file to          <USB>\Office\configuration.xml
+    3. ONE TIME on your bench, pre-download the bits onto the USB:
+           cd <USB>\Office
+           .\setup.exe /download configuration.xml
+       -> fills <USB>\Office\Office\Data\... (a few GB)
+    4. Per machine, setup.ps1 already runs:  setup.exe /configure configuration.xml
+       with the working dir set to the Office folder, so ODT installs from the local
+       \Office\Data next to setup.exe - no internet needed, no SourcePath to hardcode
+       (keeps it portable across USB drive letters).
+
+  ONLINE instead (no pre-download): same file, skip step 3. Each machine downloads
+  ~2-4 GB from the Microsoft CDN at install time (internet required).
+
+  Edit the product line for LTSC perpetual instead of 365:
+    <Product ID="ProPlus2024Volume" PIDKEY="XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"> ... </Product>
+-->
+<Configuration>
+
+  <!-- OfficeClientEdition: 64 (default today) or 32. Channel: Current = always latest.
+       Do NOT add SourcePath here - working dir set by setup.ps1 keeps it drive-letter portable. -->
+  <Add OfficeClientEdition="64" Channel="Current">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="pt-br" />
+      <!-- Drop the apps you do not ship. Remove a line to INCLUDE that app. -->
+      <ExcludeApp ID="Groove" />     <!-- OneDrive for Business (old sync client) -->
+      <ExcludeApp ID="Lync" />       <!-- Skype for Business -->
+      <ExcludeApp ID="Bing" />       <!-- Bing search add-in for Edge/Chrome -->
+      <!-- <ExcludeApp ID="Access" /> -->
+      <!-- <ExcludeApp ID="Publisher" /> -->
+      <!-- <ExcludeApp ID="OneDrive" /> -->
+      <!-- <ExcludeApp ID="Teams" /> -->
+      <!-- <ExcludeApp ID="OneNote" /> -->
+    </Product>
+  </Add>
+
+  <!-- Remove any old MSI-based Office (2016/2019 retail/volume) before installing. -->
+  <RemoveMSI />
+
+  <!-- Keep Office auto-updating after install. -->
+  <Updates Enabled="TRUE" />
+
+  <!-- Silent install: no UI, no prompts, accept the license, do not auto-launch apps,
+       and force-close any open Office app so a stuck process never blocks the install. -->
+  <Display Level="None" AcceptEULA="TRUE" />
+  <Property Name="FORCEAPPSHUTDOWN" Value="TRUE" />
+  <Property Name="AUTOACTIVATE" Value="0" />          <!-- 365: user signs in to activate -->
+  <Property Name="SharedComputerLicensing" Value="0" /> <!-- set 1 only for VDI/RDS hosts -->
+
+</Configuration>

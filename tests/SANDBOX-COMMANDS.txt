@@ -1,0 +1,155 @@
+========================================
+ SANDBOX TEST COMMANDS
+========================================
+
+Flow: STEP 0 (on Windows) opens the Sandbox. Inside it, bootstrap.ps1 RUNS BY
+ITSELF at login: pre-creates setupadmin -> runs setup.ps1 INTERACTIVELY (the GUI,
+production-like) -> at the end prints  RESULT: PASSED / FAILED.
+Fill the GUI: First 'Test', Last 'User' (the Username auto-fills to test.user -
+you do NOT type it), domain example.com.br, sector IT, printer 'Test Printer'.
+For the headless automated assertion (no GUI), use -Headless.
+STEPS 1-3 are only needed to RE-RUN it by hand inside the Sandbox.
+
+
+========================================
+ STEP 0 — ON WINDOWS (HOST): open the Sandbox
+========================================
+
+Prerequisite (once): Windows Sandbox enabled
+  Turn Windows features on/off -> Windows Sandbox -> reboot
+
+These commands are PATH-AGNOSTIC: they work no matter where this repo lives
+(a WSL share \\wsl.localhost\<distro>\... or a normal Windows folder such as
+C:\projects\...). prep.ps1 locates itself ($PSScriptRoot), so you never edit a path.
+
+EASIEST - just double-click:
+  tests\run-sandbox.bat
+  (it auto-elevates with a UAC prompt and runs prep.ps1 next to it)
+
+MANUAL - from an ADMIN PowerShell (admin: it creates C:\SandboxTest at C: root):
+  Win+X -> "Terminal (Admin)" or "PowerShell (Admin)", then:
+
+  # A) you are already INSIDE the tests folder (File Explorer -> address bar -> type: powershell):
+  powershell -ExecutionPolicy Bypass -File .\prep.ps1
+
+  # B) from anywhere, point at the .bat by full path (drag the file into the window to autofill it):
+  powershell -ExecutionPolicy Bypass -File "<full-path-to>\tests\prep.ps1"
+
+  TIP: dragging run-sandbox.bat (or prep.ps1) from Explorer into the terminal
+       pastes its exact full path - no typing, works for any user/distro/folder.
+
+-> The Sandbox opens and bootstrap.ps1 runs by itself. Read the RESULT at the end.
+
+
+========================================
+ IF SMART APP CONTROL / SMARTSCREEN BLOCKS run-sandbox.bat
+========================================
+
+Why: the .bat is unsigned AND you ran it from the WSL share
+(\\wsl.localhost\... = a NETWORK / untrusted zone). Together, Smart App
+Control (SAC) / SmartScreen blocks it. This is NOT a virus.
+
+Do NOT disable Smart App Control - it protects the whole machine and you
+do not need to. The real trigger is the network location, not the content.
+
+Fix - run from a LOCAL path. In an ADMIN PowerShell:
+
+  # 1) copy tests to a local disk (leaves the \\wsl.localhost network zone)
+  #    drag the tests folder into the window to autofill <full-path-to>\tests
+  Copy-Item "<full-path-to>\tests" "C:\sandbox-test" -Recurse -Force
+
+  # 2) strip the Mark of the Web (the "untrusted file" tag) from everything
+  Get-ChildItem C:\sandbox-test -Recurse | Unblock-File
+
+  # 3) run it
+  cd C:\sandbox-test
+  powershell -ExecutionPolicy Bypass -File .\prep.ps1
+
+A command you TYPE in an admin console is user-initiated, so SAC does not
+block it the way it blocks double-clicking an untrusted file from a share.
+
+Note: Unblock-File removes the Mark of the Web, but running straight from
+\\wsl.localhost keeps the network-zone block - so copy to C:\ FIRST.
+
+
+========================================
+ INSIDE THE SANDBOX (re-run by hand)
+========================================
+
+Open PowerShell: Win+R -> powershell -> Enter
+
+
+----------------------------------------
+ STEP 1 — Re-run the test manually
+----------------------------------------
+
+# Interactive (default, production-like GUI):
+powershell -ExecutionPolicy Bypass -File C:\Tests\bootstrap.ps1
+
+# Headless (automated assertion, no GUI):
+powershell -ExecutionPolicy Bypass -File C:\Tests\bootstrap.ps1 -Headless
+
+
+----------------------------------------
+ STEP 2 — If you hit an encoding error
+         (characters like a€")
+----------------------------------------
+
+$f = "C:\USB\setup.ps1"; $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8); [System.IO.File]::WriteAllText($f, $raw, (New-Object System.Text.UTF8Encoding $true)); powershell -ExecutionPolicy Bypass -File $f -Unattended -TestFullName 'Test User' -TestUsername 'test.user'
+
+
+----------------------------------------
+ STEP 2b — Run setup.ps1 directly (skip bootstrap's re-prep)
+----------------------------------------
+
+# bootstrap already staged C:\USB. To re-run only setup.ps1 (single-window GUI:
+# form on top + live progress at the bottom), without re-prepping:
+powershell -ExecutionPolicy Bypass -File C:\USB\setup.ps1
+
+
+----------------------------------------
+ STEP 3 — Verdict and log
+----------------------------------------
+
+# The verdict (PASSED/FAILED) already appears at the end of bootstrap.
+# To inspect the full log:
+notepad C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt
+
+# Count real errors by hand (only [ERROR]/[FATAL] fail; [WARN] is expected):
+Get-Content C:\Users\WDAGUtilityAccount\Desktop\win11_setup_log.txt | Select-String -Pattern '\[(ERROR|FATAL)\]'
+
+
+----------------------------------------
+ MANUAL CHECKS (after the test)
+----------------------------------------
+
+# Was the test user created? (test.user - it should have been auto-derived from First 'Test' + Last 'User')
+Get-LocalUser | Where-Object Enabled
+
+# Was the signature created? (test.user.htm)
+Get-Item "$env:APPDATA\Microsoft\Signatures\*"
+
+# Does setupadmin exist and did setup rotate its password?
+Get-LocalUser -Name setupadmin
+
+
+----------------------------------------
+ EXPECTED FROM A PASSING TEST
+----------------------------------------
+
+- RESULT: PASSED (exit 0, 0 errors)
+- WARN (normal, do NOT fail): WiFi (no adapter),
+  Ninite/Office/Belarc/Epson (binaries absent in the sandbox)
+- OK "Removed bootstrap credential file: ...Panther\unattend.xml" is the new
+  post-rotation scrub; a WARN "Could not remove ..." there is also benign here
+- If [ERROR] or [FATAL] appears -> investigate the red line
+
+
+----------------------------------------
+ NOTES
+----------------------------------------
+
+- Closing the Sandbox wipes EVERYTHING (reset)
+- For a new test: close it, open sandbox.wsb again
+- The Sandbox lives at: C:\SandboxTest\sandbox.wsb
+- To open it:  Start-Process C:\SandboxTest\sandbox.wsb
