@@ -52,7 +52,8 @@ param(
     # the script keeps its legacy behaviour (autounattend.xml only) so existing callers/tests
     # are unaffected.
     [switch]$GenerateConfig,
-    # Also prompt the 7 $Path* overrides. Off by default: the config.example.ps1 defaults are used.
+    # Also prompt the 7 $Path* overrides. Off by default: an existing config.ps1's paths are
+    # preserved as-is, else the config.example.ps1 defaults are used.
     [switch]$Advanced,
     # Where to write config.ps1 (default: next to autounattend.xml on the USB root).
     [string]$ConfigPath,
@@ -265,7 +266,10 @@ function Import-ConfigDefault {
     }
     foreach ($k in @('AdminAccount', 'AdminNewPass', 'UserInitialPass', 'EmailDomains',
                      'StaticGateway', 'StaticPrefixLength', 'DnsServers', 'WallpaperFile',
-                     'WallpaperByDomain', 'WifiSSID', 'WifiPass', 'Bookmarks')) {
+                     'WallpaperByDomain', 'WifiSSID', 'WifiPass', 'Bookmarks',
+                     'PathOffice', 'PathBelarc', 'PathEpson', 'PathWebAgent', 'PathSignatures',
+                     'PathVPN', 'PathCloudAgent', 'CloudAgentInstaller', 'CloudAgentInstallDir',
+                     'DesktopShortcutBookmarks')) {
         # Read .Value (property access) rather than -ValueOnly (pipeline output): the latter
         # ENUMERATES the value, collapsing a single-element $EmailDomains/$Bookmarks array to a
         # scalar and an empty array to $null. .Value preserves the array shape.
@@ -273,6 +277,85 @@ function Import-ConfigDefault {
         if ($null -ne $var) { $result[$k] = $var.Value }
     }
     return $result
+}
+
+# Canonical $Path* variable set (name -> default subfolder relative to $ScriptDir; '' = the USB
+# root itself). Single source for the Advanced prompts and for the per-var fallback when an
+# existing config.ps1 omits one. Order mirrors config.example.ps1.
+$script:PathVarSpecs = [ordered]@{
+    PathOffice     = 'Office'
+    PathBelarc     = ''
+    PathEpson      = 'Drivers Epson'
+    PathWebAgent   = 'WebAgent\windows'
+    PathSignatures = 'signatures-2026'
+    PathVPN        = 'VPN'
+    PathCloudAgent = 'CloudAgent'
+}
+
+# Undo the load-time expansion of a $Path* value read back by Import-ConfigDefault (its dot-source
+# expanded "$ScriptDir\..." with -ScriptDirValue baked in). Classifies the value against that same
+# root: Root (the root itself), Suffix (below it; Suffix = the relative part), or Literal
+# (anywhere else - kept verbatim). Comparisons are case-insensitive because Windows paths are; the
+# prefix keeps its trailing '\' so a sibling like C:\USBX never false-matches root C:\USB.
+function Split-ScriptDirPath {
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$ScriptDirValue
+    )
+    $root = $ScriptDirValue.TrimEnd('\')   # a drive-root USB arrives as 'E:\'
+    if ($Value.TrimEnd('\') -eq $root) { return @{ Kind = 'Root'; Suffix = '' } }
+    $prefix = $root + '\'
+    if ($Value.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return @{ Kind = 'Suffix'; Suffix = $Value.Substring($prefix.Length) }
+    }
+    return @{ Kind = 'Literal'; Suffix = $Value }
+}
+
+# The $Path* block the wizard emits. When the loaded config.ps1 carried any path / cloud-agent
+# value, rebuild the block from those values so a re-run PRESERVES them (the same "Enter keeps the
+# value" promise the scalar prompts make); otherwise return $script:DefaultPathBlock verbatim,
+# comments included. $ScriptDirValue MUST be the same root that was passed to Import-ConfigDefault
+# - Split-ScriptDirPath strips it back off the expanded values. Suffixes/literals are emitted
+# single-quoted (Format-PsString), the same injection-safe form the Advanced prompts use.
+function ConvertTo-PathBlock {
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][hashtable]$Defaults,
+        [Parameter(Mandatory)][string]$ScriptDirValue
+    )
+    $known = @($script:PathVarSpecs.Keys) + @('CloudAgentInstaller', 'CloudAgentInstallDir')
+    if (@($known | Where-Object { $Defaults.ContainsKey($_) }).Count -eq 0) {
+        return $script:DefaultPathBlock
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('# --- Paths — everything on the USB ($ScriptDir = USB root, set by setup.ps1) ---')
+    $lines.Add('# Preserved from the existing config.ps1 (see config.example.ps1 for the defaults).')
+    foreach ($name in $script:PathVarSpecs.Keys) {
+        if ($name -eq 'PathCloudAgent') {   # section break, mirrors the default block
+            $lines.Add('')
+            $lines.Add('# --- Cloud agent (optional vendor toolkit; empty $PathCloudAgent = skip the step) ---')
+        }
+        if ($Defaults.ContainsKey($name)) {
+            $split = Split-ScriptDirPath -Value ([string]$Defaults[$name]) -ScriptDirValue $ScriptDirValue
+            switch ($split.Kind) {
+                'Root'    { $lines.Add(('${0} = $ScriptDir' -f $name)) }
+                'Suffix'  { $lines.Add(('${0} = Join-Path $ScriptDir {1}' -f $name, (Format-PsString $split.Suffix))) }
+                'Literal' { $lines.Add(('${0} = {1}' -f $name, (Format-PsString $split.Suffix))) }
+            }
+        } else {
+            # Var absent from the loaded config (partial/legacy file): emit its default.
+            $suffix = $script:PathVarSpecs[$name]
+            if ([string]::IsNullOrEmpty($suffix)) { $lines.Add(('${0} = $ScriptDir' -f $name)) }
+            else { $lines.Add(('${0} = Join-Path $ScriptDir {1}' -f $name, (Format-PsString $suffix))) }
+        }
+    }
+    $installer  = if ($Defaults.ContainsKey('CloudAgentInstaller'))  { [string]$Defaults['CloudAgentInstaller'] }  else { 'install.bat' }
+    $installDir = if ($Defaults.ContainsKey('CloudAgentInstallDir')) { [string]$Defaults['CloudAgentInstallDir'] } else { 'C:\CloudAgent' }
+    $lines.Add(('$CloudAgentInstaller  = {0}' -f (Format-PsString $installer)))
+    $lines.Add(('$CloudAgentInstallDir = {0}' -f (Format-PsString $installDir)))
+    return ($lines -join "`n")
 }
 
 # Test seam: stop here so -LoadOnly defines only the pure helpers above (tests/unit), never the body.
@@ -571,24 +654,36 @@ if ($GenerateConfig) {
         $cfg['Bookmarks'] = $bmList
     }
 
+    # Not prompted: carried over from the loaded config so a re-run does not reset it to @()
+    # (setup.ps1 matches these names against the ticked bookmarks; a stale name is inert).
+    $cfg['DesktopShortcutBookmarks'] = @((& $getDef 'DesktopShortcutBookmarks' $null) | Where-Object { $_ })
+
     # --- optional $Path* overrides ---
-    $pathBlock = $script:DefaultPathBlock
+    # Preserve loaded paths on a re-run: ConvertTo-PathBlock rebuilds the block from $def (same
+    # $ScriptDir root the loader expanded with); fresh runs get the default block back.
+    $pathBlock = ConvertTo-PathBlock -Defaults $def -ScriptDirValue $ScriptDir
+    if (-not $Advanced -and $pathBlock -cne $script:DefaultPathBlock) {
+        & $note 'Paths kept from the existing config.ps1 (re-run with -Advanced to change them).'
+    }
     if ($Advanced) {
         & $banner 'Paths (Advanced)'
         & $note 'Subfolder (relative to the USB root) for each asset group; Enter keeps the default.'
         $pathBlock = & {
             $lines = New-Object System.Collections.Generic.List[string]
             $lines.Add('# --- Paths — everything on the USB ($ScriptDir = USB root, set by setup.ps1) ---')
-            # name -> default suffix ('' means the USB root itself). Emitted as Join-Path with a
-            # single-quoted suffix so a typed value can never inject $(...) at dot-source time.
-            $specs = [ordered]@{
-                PathOffice      = 'Office'
-                PathBelarc      = ''
-                PathEpson       = 'Drivers Epson'
-                PathWebAgent    = 'WebAgent\windows'
-                PathSignatures  = 'signatures-2026'
-                PathCloudAgent  = 'CloudAgent'
-                PathVPN         = 'VPN'
+            # Prompt defaults: the loaded config's suffix when it has one (Enter keeps it), else
+            # the canonical default from $script:PathVarSpecs. A Literal (outside the USB root)
+            # cannot be expressed as a suffix, so it keeps the canonical default here - the
+            # non-Advanced flow is the one that preserves literals verbatim. Emitted as Join-Path
+            # with a single-quoted suffix so a typed value can never inject $(...) at dot-source.
+            $specs = [ordered]@{}
+            foreach ($name in $script:PathVarSpecs.Keys) {
+                $seed = $script:PathVarSpecs[$name]
+                if ($def.ContainsKey($name)) {
+                    $split = Split-ScriptDirPath -Value ([string]$def[$name]) -ScriptDirValue $ScriptDir
+                    if ($split.Kind -ne 'Literal') { $seed = $split.Suffix }
+                }
+                $specs[$name] = $seed
             }
             foreach ($name in $specs.Keys) {
                 $suffix = & $askText ("  `$$name suffix") $specs[$name]
@@ -599,8 +694,8 @@ if ($GenerateConfig) {
                 }
             }
             # Non-path cloud-agent scalars: keep the generated config complete in Advanced mode too.
-            $agentBat = & $askText '  $CloudAgentInstaller (bat name)' 'install.bat'
-            $agentDir = & $askText '  $CloudAgentInstallDir (local copy dir)' 'C:\CloudAgent'
+            $agentBat = & $askText '  $CloudAgentInstaller (bat name)' (& $getDef 'CloudAgentInstaller' 'install.bat')
+            $agentDir = & $askText '  $CloudAgentInstallDir (local copy dir)' (& $getDef 'CloudAgentInstallDir' 'C:\CloudAgent')
             $lines.Add(('$CloudAgentInstaller  = {0}' -f (Format-PsString $agentBat)))
             $lines.Add(('$CloudAgentInstallDir = {0}' -f (Format-PsString $agentDir)))
             $lines -join "`n"

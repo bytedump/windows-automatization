@@ -86,7 +86,8 @@ Done **once** per master USB; every machine boot after that is hands-free.
 
 > The bootstrap password typed in step 3 is temporary: `setup.ps1` rotates it on first login and
 > then **deletes `autounattend.xml` from the USB** (it embeds that password base64-encoded).
-> Re-run the wizard to regenerate it before imaging the next machine.
+> Re-run the wizard to regenerate it before imaging the next machine — Enter keeps every
+> existing value, custom `$Path*` locations included.
 
 <details>
 <summary><b>Why the ISO language must match (pt-BR)</b></summary>
