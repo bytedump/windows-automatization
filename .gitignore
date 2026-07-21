@@ -43,10 +43,11 @@ autounattend.xml
 *.dmg
 *.DMG
 
-# Images (wallpapers, drivers)
+# Images (wallpapers, drivers) — except the README screenshot
 *.jpg
 *.jpeg
 *.png
+!docs/setup-gui.png
 *.bmp
 
 # VPN — sensitive configs
